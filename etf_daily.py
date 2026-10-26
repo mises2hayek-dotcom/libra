@@ -3,9 +3,10 @@
 
 用法示例
 --------
-    python etf_daily.py 510300                          # 自动选源
-    python etf_daily.py 510300 159915 --adjust qfq       # 前复权
-    python etf_daily.py 510300 --source sina             # 指定源
+    python etf_daily.py                                 # 默认抓 513520
+    python etf_daily.py --adjust qfq                     # 513520 前复权
+    python etf_daily.py 510300 159915 --adjust qfq       # 指定标的
+    python etf_daily.py --source sina                    # 指定源
     python etf_daily.py --search 沪深300                  # 按名称查代码
 
 数据源对照
@@ -14,12 +15,13 @@
 |----------|------|--------------------|------------------------------|
 | em-cffi  | 支持 | 齐全               | 东财 + 浏览器 TLS 指纹       |
 | em       | 支持 | 齐全               | 东财 + 普通 requests         |
-| tencent  | 支持 | 无                 | 单次最多 640 根，成交量单位为手 |
-| sina     | 不支持 | 无               | 成交量单位为股               |
+| tencent  | 支持 | 无                 | 单次最多 640 根              |
+| sina     | 不支持 | 无               | 成交量原为股，已折算为手     |
 | akshare  | 支持 | 齐全               | 原库，东财裸请求             |
 
 输出：<out>/<代码>_<复权>_<开始>_<结束>.csv，UTF-8 BOM 编码，Excel 双击可看。
 列：date, open, close, high, low, volume, amount, amplitude, pct_change, change, turnover
+　　volume 统一为「手」（1 手 = 100 份），各源差异在入库前已折算。
 """
 
 from __future__ import annotations
@@ -77,6 +79,16 @@ TX_ADJUST_KEY = {"": "day", "qfq": "qfqday", "hfq": "hfqday"}
 SOURCES = ["auto", "em-cffi", "em", "tencent", "sina", "akshare"]
 AUTO_ORDER = ["em-cffi", "em", "tencent", "sina"]
 TX_MAX_BARS = 640
+DEFAULT_SYMBOL = "513520"  # 当前只关注日经 ETF，省略代码时用它
+
+# 各源成交量原始单位 -> 手的换算系数（1 手 = 100 份）
+VOLUME_TO_LOT = {
+    "em-cffi": 1.0,  # 东财已是手
+    "em": 1.0,
+    "akshare": 1.0,  # akshare 走东财，已是手
+    "tencent": 1.0,  # 腾讯已是手
+    "sina": 0.01,  # 新浪为股，除以 100
+}
 
 
 def use_direct_connection() -> None:
@@ -149,7 +161,20 @@ def _standardize(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date").drop_duplicates("date")
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    if "volume" in df.columns:
+        df["volume"] = df["volume"].round(0).astype("Int64")
+    return df
+
+
+def _to_lots(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """把成交量统一折算为手（1 手 = 100 份）。"""
+    factor = VOLUME_TO_LOT.get(source, 1.0)
+    if factor == 1.0 or "volume" not in df.columns:
+        return df
+    df = df.copy()
+    df["volume"] = (df["volume"] * factor).round(0).astype("Int64")
+    return df
 
 
 def _em_params(symbol: str, start: str, end: str, adjust: str, mid: int) -> dict:
@@ -282,7 +307,7 @@ def fetch_with_retry(
 
     for attempt in range(1, retries + 1):
         try:
-            return fetch(symbol, start, end, **kwargs)
+            return _to_lots(fetch(symbol, start, end, **kwargs), source)
         except Exception as exc:  # noqa: BLE001 - 网络异常种类多，统一重试
             last_error = exc
             if attempt < retries:
@@ -323,9 +348,11 @@ def save_csv(df: pd.DataFrame, path: Path) -> None:
 def describe(symbol: str, df: pd.DataFrame) -> str:
     first, last = df["date"].iloc[0].date(), df["date"].iloc[-1].date()
     window_return = (df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100
+    volume = df["volume"].iloc[-1] if "volume" in df.columns else float("nan")
     return (
         f"  {symbol}: {len(df)} 行  {first} ~ {last}  "
         f"最新收盘 {df['close'].iloc[-1]:.3f}  "
+        f"成交量 {volume:,.0f} 手  "
         f"区间涨跌 {window_return:+.2f}%"
     )
 
@@ -357,7 +384,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("symbols", nargs="*", help="ETF 代码，可多个：510300 159915 ...")
+    parser.add_argument(
+        "symbols", nargs="*", help=f"ETF 代码，省略时默认 {DEFAULT_SYMBOL}（可传多个）"
+    )
     parser.add_argument("--start", help="开始日期，默认一年前（20240101 或 2024-01-01）")
     parser.add_argument("--end", help="结束日期，默认今天")
     parser.add_argument(
@@ -392,9 +421,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.search:
         return search_etf(args.search)
 
-    if not args.symbols:
-        print("请至少提供一个 ETF 代码，或用 --search 查代码。示例：python etf_daily.py 510300")
-        return 2
+    symbols: list[str] = args.symbols or [DEFAULT_SYMBOL]
 
     today = date.today()
     start = parse_date(args.start, today - timedelta(days=365))
@@ -416,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
         f"区间 {start} ~ {end}  复权 {adjust_label}  数据源 {args.source}  "
         f"输出到 {out_dir.resolve()}"
     )
-    for index, raw in enumerate(args.symbols):
+    for index, raw in enumerate(symbols):
         try:
             symbol = normalize_symbol(raw)
         except ValueError as exc:
@@ -424,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
             failures.append(raw)
             continue
 
-        print(f"[{index + 1}/{len(args.symbols)}] {symbol} 抓取中 ...")
+        print(f"[{index + 1}/{len(symbols)}] {symbol} 抓取中 ...")
         try:
             df, used = fetch_daily(
                 symbol, start, end, adjust, source=args.source, retries=args.retries
@@ -438,14 +465,14 @@ def main(argv: list[str] | None = None) -> int:
         save_csv(df, path)
         print(describe(symbol, df))
         print(f"  数据源 {used}  -> {path}")
-        if index < len(args.symbols) - 1:
+        if index < len(symbols) - 1:
             time.sleep(args.sleep)
 
     if failures:
         print(f"完成，{len(failures)} 个失败：{', '.join(failures)}", file=sys.stderr)
         return 1
 
-    print(f"完成，共 {len(args.symbols)} 个标的。")
+    print(f"完成，共 {len(symbols)} 个标的。")
     return 0
 
 
