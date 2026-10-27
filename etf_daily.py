@@ -8,6 +8,8 @@
     python etf_daily.py 510300 159915 --adjust qfq       # 指定标的
     python etf_daily.py --source sina                    # 指定源
     python etf_daily.py --search 沪深300                  # 按名称查代码
+    python etf_daily.py --to-mysql                       # 抓完直接 upsert 进 MySQL
+    python etf_daily.py --to-mysql --mysql-db libra_schema --mysql-user root
 
 数据源对照
 ----------
@@ -22,6 +24,13 @@
 输出：<out>/<代码>_<复权>_<开始>_<结束>.csv，UTF-8 BOM 编码，Excel 双击可看。
 列：date, open, close, high, low, volume, amount, amplitude, pct_change, change, turnover
 　　volume 统一为「手」（1 手 = 100 份），各源差异在入库前已折算。
+
+MySQL 入库（--to-mysql）
+-----------------------
+依赖 pymysql。连接参数优先级：命令行 > 环境变量(MYSQL_HOST/PORT/USER/PASSWORD/DB) > 默认值。
+密码建议走环境变量 MYSQL_PASSWORD，别写进命令行历史。
+表不存在时自动 CREATE TABLE IF NOT EXISTS；已存在则不改结构。
+写入为 INSERT ... ON DUPLICATE KEY UPDATE，主键 (symbol, trade_date, adjust)，重复抓取幂等。
 """
 
 from __future__ import annotations
@@ -345,6 +354,146 @@ def save_csv(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
+MYSQL_COLUMNS = [
+    "symbol",
+    "trade_date",
+    "open",
+    "close",
+    "high",
+    "low",
+    "volume",
+    "amount",
+    "amplitude",
+    "pct_change",
+    "price_change",
+    "turnover",
+    "adjust",
+]
+MYSQL_UPDATE = [c for c in MYSQL_COLUMNS if c not in {"symbol", "trade_date", "adjust"}]
+MYSQL_DDL = """
+CREATE TABLE IF NOT EXISTS `{table}` (
+  symbol       VARCHAR(6)    NOT NULL COMMENT 'ETF 代码',
+  trade_date   DATE          NOT NULL COMMENT '交易日',
+  open         DECIMAL(10,3) NOT NULL,
+  close        DECIMAL(10,3) NOT NULL,
+  high         DECIMAL(10,3) NOT NULL,
+  low          DECIMAL(10,3) NOT NULL,
+  volume       BIGINT        NOT NULL COMMENT '成交量（手）',
+  amount       DECIMAL(20,2) NULL COMMENT '成交额（元）',
+  amplitude    DECIMAL(8,3)  NULL COMMENT '振幅 %',
+  pct_change   DECIMAL(8,3)  NULL COMMENT '涨跌幅 %',
+  price_change DECIMAL(10,3) NULL COMMENT '涨跌额',
+  turnover     DECIMAL(8,3)  NULL COMMENT '换手率 %',
+  adjust       VARCHAR(4)    NOT NULL DEFAULT 'none' COMMENT 'none/qfq/hfq',
+  created_at   TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (symbol, trade_date, adjust),
+  KEY idx_trade_date (trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+
+def mysql_config(args: argparse.Namespace) -> dict:
+    """命令行 > 环境变量 > 默认值。"""
+    import getpass
+
+    password = (
+        args.mysql_password
+        or os.environ.get("MYSQL_PASSWORD")
+        or getpass.getpass("MySQL 密码（直接回车表示空密码）: ")
+        or ""
+    )
+    db = args.mysql_db or os.environ.get("MYSQL_DB") or "libra_schema"
+    table = args.mysql_table or "etf_daily"
+    if not re.fullmatch(r"[A-Za-z0-9_]+", table):
+        raise ValueError(f"表名只能包含字母、数字、下划线：{table}")
+    return {
+        "host": args.mysql_host or os.environ.get("MYSQL_HOST") or "127.0.0.1",
+        "port": int(args.mysql_port or os.environ.get("MYSQL_PORT") or 3306),
+        "user": args.mysql_user or os.environ.get("MYSQL_USER") or "root",
+        "password": password,
+        "database": db,
+        "table": table,
+    }
+
+
+def _cell(value: float, digits: int) -> float | None:
+    return None if pd.isna(value) else round(float(value), digits)
+
+
+def upsert_to_mysql(df: pd.DataFrame, symbol: str, adjust: str, cfg: dict) -> tuple[int, int]:
+    """把 DataFrame upsert 进 MySQL，返回 (写入行数, 影响行数)。"""
+    try:
+        import pymysql
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("未安装 pymysql，请执行 pip install pymysql") from exc
+
+    table = cfg["table"]
+    placeholders = ", ".join(["%s"] * len(MYSQL_COLUMNS))
+    updates = ", ".join(f"{c}=VALUES({c})" for c in MYSQL_UPDATE)
+    sql = (
+        f"INSERT INTO `{table}` ({', '.join(MYSQL_COLUMNS)}) VALUES ({placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {updates}"
+    )
+
+    # 新浪等源缺列，reindex 补成 NaN，保证属性访问一致
+    frame = df.reindex(
+        columns=[
+            "date",
+            "open",
+            "close",
+            "high",
+            "low",
+            "volume",
+            "amount",
+            "amplitude",
+            "pct_change",
+            "change",
+            "turnover",
+        ]
+    )
+
+    rows = [
+        (
+            symbol,
+            pd.to_datetime(r.date).date(),
+            _cell(r.open, 3),
+            _cell(r.close, 3),
+            _cell(r.high, 3),
+            _cell(r.low, 3),
+            0 if pd.isna(r.volume) else int(r.volume),
+            _cell(r.amount, 2),
+            _cell(r.amplitude, 3),
+            _cell(r.pct_change, 3),
+            _cell(r.change, 3),  # CSV 列 change -> MySQL 列 price_change
+            _cell(r.turnover, 3),
+            adjust or "none",
+        )
+        for r in frame.itertuples(index=False)
+    ]
+
+    conn = pymysql.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        charset="utf8mb4",
+        autocommit=False,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(MYSQL_DDL.format(table=table))
+            affected = cur.executemany(sql, rows)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return len(rows), affected
+
+
 def describe(symbol: str, df: pd.DataFrame) -> str:
     first, last = df["date"].iloc[0].date(), df["date"].iloc[-1].date()
     window_return = (df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100
@@ -407,6 +556,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--direct", action="store_true", help="忽略系统代理，直连行情站点")
     parser.add_argument("--proxy", metavar="URL", help="指定代理，如 http://127.0.0.1:7897")
     parser.add_argument("--search", metavar="关键词", help="按名称查代码，如 --search 沪深300")
+
+    db = parser.add_argument_group("MySQL 入库（--to-mysql）")
+    db.add_argument("--to-mysql", action="store_true", help="抓取后 upsert 进 MySQL，需 pymysql")
+    db.add_argument("--mysql-host", help="默认 127.0.0.1，或环境变量 MYSQL_HOST")
+    db.add_argument("--mysql-port", type=int, help="默认 3306，或 MYSQL_PORT")
+    db.add_argument("--mysql-user", help="默认 root，或 MYSQL_USER")
+    db.add_argument("--mysql-password", help="建议改用环境变量 MYSQL_PASSWORD，避免留痕")
+    db.add_argument("--mysql-db", help="默认 libra_schema，或 MYSQL_DB")
+    db.add_argument("--mysql-table", help="默认 etf_daily")
     return parser
 
 
@@ -439,6 +597,14 @@ def main(argv: list[str] | None = None) -> int:
     failures: list[str] = []
     adjust_label = args.adjust if adjust else "none"
 
+    cfg: dict | None = None
+    if args.to_mysql:
+        try:
+            cfg = mysql_config(args)
+        except Exception as exc:  # noqa: BLE001
+            print(f"! MySQL 配置有误：{exc}", file=sys.stderr)
+            return 2
+
     print(
         f"区间 {start} ~ {end}  复权 {adjust_label}  数据源 {args.source}  "
         f"输出到 {out_dir.resolve()}"
@@ -465,6 +631,18 @@ def main(argv: list[str] | None = None) -> int:
         save_csv(df, path)
         print(describe(symbol, df))
         print(f"  数据源 {used}  -> {path}")
+
+        if cfg is not None:
+            try:
+                written, affected = upsert_to_mysql(df, symbol, adjust, cfg)
+                print(
+                    f"  MySQL {cfg['database']}.{cfg['table']}: 提交 {written} 行，"
+                    f"影响 {affected} 行（MySQL 中更新一行计 2）"
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ! MySQL 写入失败：{exc}", file=sys.stderr)
+                failures.append(f"{symbol}[mysql]")
+
         if index < len(symbols) - 1:
             time.sleep(args.sleep)
 
