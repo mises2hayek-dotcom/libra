@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""检查 libra_schema.etf_daily 的建表语句与数据情况。
+"""检查并更新 libra_schema.etf_daily 的表结构与数据情况。
 
 为什么需要这个脚本
 ------------------
@@ -11,6 +11,7 @@
 用法
 ----
     python db_check.py                       # 读环境变量 / 交互输入密码
+    python db_check.py --migrate             # 检查并补齐缺失列（幂等）
     python db_check.py --mysql-password xxx
     python db_check.py --mysql-db libra_schema --mysql-table etf_daily --symbol 513520
 
@@ -42,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mysql-db", help="默认 libra_schema，或 MYSQL_DB")
     parser.add_argument("--mysql-table", default="etf_daily", help="默认 etf_daily")
     parser.add_argument("--symbol", default="513520", help="统计用的 ETF 代码，默认 513520")
+    parser.add_argument("--migrate", action="store_true",
+                        help="对比预期结构，补齐缺失列（幂等，已存在则跳过）")
     return parser
 
 
@@ -61,6 +64,55 @@ def q(conn, sql: str, params: tuple = ()):
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchall()
+
+
+def run(conn, sql: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+
+# 预期结构（与 etf_daily.py 的 MYSQL_DDL 对齐）：缺失列 -> 补齐 DDL
+MIGRATIONS = [
+    (
+        "updated_at",
+        "ALTER TABLE `{db}`.`{table}` ADD COLUMN updated_at TIMESTAMP NOT NULL "
+        "DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at",
+    ),
+    (
+        "ma5",
+        "ALTER TABLE `{db}`.`{table}` ADD COLUMN ma5 DECIMAL(10,3) NULL "
+        "COMMENT '5日均线' AFTER `close`",
+    ),
+    (
+        "ma20",
+        "ALTER TABLE `{db}`.`{table}` ADD COLUMN ma20 DECIMAL(10,3) NULL "
+        "COMMENT '20日均线' AFTER `ma5`",
+    ),
+    (
+        "ma60",
+        "ALTER TABLE `{db}`.`{table}` ADD COLUMN ma60 DECIMAL(10,3) NULL "
+        "COMMENT '60日均线' AFTER `ma20`",
+    ),
+]
+
+
+def migrate(conn, db: str, table: str) -> list[str]:
+    """按 MIGRATIONS 逐项检查，缺失才执行，返回本次补齐的列名。"""
+    existing = {
+        r[0]
+        for r in q(conn, "SELECT column_name FROM information_schema.columns "
+                         "WHERE table_schema = %s AND table_name = %s", (db, table))
+    }
+    applied = []
+    for col, ddl in MIGRATIONS:
+        if col in existing:
+            print(f"  = {col} 已存在，跳过")
+            continue
+        run(conn, ddl.format(db=db, table=table))
+        applied.append(col)
+        print(f"  + 已添加列 {col}")
+    return applied
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -112,7 +164,16 @@ def main(argv: list[str] | None = None) -> int:
     _, engine, est_rows, collation = rows[0]
     print(f"[表] {db}.{table}  引擎 {engine}  估算行数 {est_rows}  排序规则 {collation}")
 
-    # 3) 建表语句
+    # 3) 结构更新（--migrate 时执行）
+    if args.migrate:
+        print("\n--- 结构更新（--migrate）---")
+        applied = migrate(conn, db, table)
+        if applied:
+            print(f"本次共补齐 {len(applied)} 列：{', '.join(applied)}")
+        else:
+            print("结构与预期一致，无需变更。")
+
+    # 4) 建表语句
     create_sql = q(conn, f"SHOW CREATE TABLE `{db}`.`{table}`")[0][1]
     print("\n--- SHOW CREATE TABLE ---")
     print(create_sql)
@@ -134,7 +195,19 @@ def main(argv: list[str] | None = None) -> int:
         print("  ! 缺少 (symbol, trade_date, adjust) 唯一键，重复抓取会产生重复行。")
         print("    修复：ALTER TABLE `%s`.`%s` ADD UNIQUE KEY uk_symbol_date_adjust (symbol, trade_date, adjust);" % (db, table))
 
-    # 5) 数据概览
+    # 5) 缺列提醒（未加 --migrate 时）
+    if not args.migrate:
+        existing = {
+            r[0]
+            for r in q(conn, "SELECT column_name FROM information_schema.columns "
+                             "WHERE table_schema = %s AND table_name = %s", (db, table))
+        }
+        missing = [col for col, _ in MIGRATIONS if col not in existing]
+        if missing:
+            print(f"\n  ! 表缺少预期的列：{', '.join(missing)}")
+            print("    补齐：python db_check.py --migrate")
+
+    # 6) 数据概览
     print("\n--- 数据概览 ---")
     total = q(conn, f"SELECT COUNT(*) FROM `{db}`.`{table}`")[0][0]
     print(f"  总行数：{total}")
@@ -152,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     if cnt == 0:
         print("  ! 这个代码没有数据。若抓取时用的是别的代码，用 --symbol 指定。")
 
-    # 6) 最近 3 行
+    # 7) 最近 3 行
     if cnt:
         rows = q(conn, f"SELECT trade_date, open, close, high, low, volume, pct_change "
                        f"FROM `{db}`.`{table}` WHERE symbol = %s "

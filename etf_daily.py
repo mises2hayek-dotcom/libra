@@ -3,7 +3,7 @@
 
 用法示例
 --------
-    python etf_daily.py                                 # 默认抓 513520
+    python etf_daily.py                                 # 默认抓 513520，2024-01-01 起
     python etf_daily.py --adjust qfq                     # 513520 前复权
     python etf_daily.py 510300 159915 --adjust qfq       # 指定标的
     python etf_daily.py --source sina                    # 指定源
@@ -22,8 +22,10 @@
 | akshare  | 支持 | 齐全               | 原库，东财裸请求             |
 
 输出：<out>/<代码>_<复权>_<开始>_<结束>.csv，UTF-8 BOM 编码，Excel 双击可看。
-列：date, open, close, high, low, volume, amount, amplitude, pct_change, change, turnover
+列：date, open, close, high, low, volume, amount, amplitude, pct_change, change, turnover, ma5, ma20, ma60
 　　volume 统一为「手」（1 手 = 100 份），各源差异在入库前已折算。
+　　ma5/ma20/ma60 为 close 的移动平均。为保证区间头部的均线值准确，
+　　实际抓取会向前多取 130 个日历日做预热，输出时再裁剪回请求区间。
 
 MySQL 入库（--to-mysql）
 -----------------------
@@ -89,6 +91,7 @@ SOURCES = ["auto", "em-cffi", "em", "tencent", "sina", "akshare"]
 AUTO_ORDER = ["em-cffi", "em", "tencent", "sina"]
 TX_MAX_BARS = 640
 DEFAULT_SYMBOL = "513520"  # 当前只关注日经 ETF，省略代码时用它
+DEFAULT_START = date(2024, 1, 1)  # 默认抓取起点（--start 未指定时生效）
 
 # 各源成交量原始单位 -> 手的换算系数（1 手 = 100 份）
 VOLUME_TO_LOT = {
@@ -98,6 +101,11 @@ VOLUME_TO_LOT = {
     "tencent": 1.0,  # 腾讯已是手
     "sina": 0.01,  # 新浪为股，除以 100
 }
+
+# 移动平均线：列名 -> 窗口（交易日）
+MA_WINDOWS = {"ma5": 5, "ma20": 20, "ma60": 60}
+# 计算均线用的预热抓取量（日历日）：60 个交易日 ≈ 88 个日历日，留足节假日余量
+MA_WARMUP_DAYS = 130
 
 
 def use_direct_connection() -> None:
@@ -183,6 +191,16 @@ def _to_lots(df: pd.DataFrame, source: str) -> pd.DataFrame:
         return df
     df = df.copy()
     df["volume"] = (df["volume"] * factor).round(0).astype("Int64")
+    return df
+
+
+def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
+    """基于 close 计算 MA5/MA20/MA60，窗口不足的位置为 NaN（入库转 NULL）。"""
+    if df.empty or "close" not in df.columns:
+        return df
+    df = df.copy()
+    for col, window in MA_WINDOWS.items():
+        df[col] = df["close"].rolling(window, min_periods=window).mean().round(3)
     return df
 
 
@@ -334,18 +352,42 @@ def fetch_daily(
     source: str = "auto",
     retries: int = 3,
 ) -> tuple[pd.DataFrame, str]:
-    """抓取日线，返回 (DataFrame, 实际使用的数据源)。"""
+    """抓取日线，返回 (DataFrame, 实际使用的数据源)。
+
+    auto 模式下校验数据完整性：若某源返回的第一根 K 线晚于请求起点
+    （如腾讯 640 根上限导致截断），视为不完整，继续尝试下一源；
+    所有源都不完整时，采用覆盖最早的那个并给出警告。
+    """
     if source != "auto":
         return fetch_with_retry(source, symbol, start, end, adjust, retries), source
 
     errors: list[str] = []
+    fallback: tuple[pd.DataFrame, str] | None = None
+    lo = pd.to_datetime(dashed(start))
     for candidate in AUTO_ORDER:
         try:
             df = fetch_with_retry(candidate, symbol, start, end, adjust, retries=1)
-            return df, candidate
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{candidate}: {exc}")
             print(f"  - {candidate} 不可用（{exc}）", file=sys.stderr)
+            continue
+        if df["date"].iloc[0] <= lo:
+            return df, candidate
+        print(
+            f"  - {candidate} 数据不完整（最早 {df['date'].iloc[0].date()}，"
+            f"晚于请求起点 {dashed(start)}），尝试下一源",
+            file=sys.stderr,
+        )
+        if fallback is None or df["date"].iloc[0] < fallback[0]["date"].iloc[0]:
+            fallback = (df, candidate)
+    if fallback:
+        df, used = fallback
+        print(
+            f"  ! 所有可用源均不完整，采用 {used}（最早 {df['date'].iloc[0].date()}）；"
+            f"建议换 --source 或缩短区间",
+            file=sys.stderr,
+        )
+        return df, used
     raise RuntimeError("所有数据源均失败：\n    " + "\n    ".join(errors))
 
 
@@ -359,6 +401,9 @@ MYSQL_COLUMNS = [
     "trade_date",
     "open",
     "close",
+    "ma5",
+    "ma20",
+    "ma60",
     "high",
     "low",
     "volume",
@@ -376,6 +421,9 @@ CREATE TABLE IF NOT EXISTS `{table}` (
   trade_date   DATE          NOT NULL COMMENT '交易日',
   open         DECIMAL(10,3) NOT NULL,
   close        DECIMAL(10,3) NOT NULL,
+  ma5          DECIMAL(10,3) NULL COMMENT '5日均线',
+  ma20         DECIMAL(10,3) NULL COMMENT '20日均线',
+  ma60         DECIMAL(10,3) NULL COMMENT '60日均线',
   high         DECIMAL(10,3) NOT NULL,
   low          DECIMAL(10,3) NOT NULL,
   volume       BIGINT        NOT NULL COMMENT '成交量（手）',
@@ -442,6 +490,9 @@ def upsert_to_mysql(df: pd.DataFrame, symbol: str, adjust: str, cfg: dict) -> tu
             "date",
             "open",
             "close",
+            "ma5",
+            "ma20",
+            "ma60",
             "high",
             "low",
             "volume",
@@ -459,6 +510,9 @@ def upsert_to_mysql(df: pd.DataFrame, symbol: str, adjust: str, cfg: dict) -> tu
             pd.to_datetime(r.date).date(),
             _cell(r.open, 3),
             _cell(r.close, 3),
+            _cell(r.ma5, 3),
+            _cell(r.ma20, 3),
+            _cell(r.ma60, 3),
             _cell(r.high, 3),
             _cell(r.low, 3),
             0 if pd.isna(r.volume) else int(r.volume),
@@ -498,11 +552,17 @@ def describe(symbol: str, df: pd.DataFrame) -> str:
     first, last = df["date"].iloc[0].date(), df["date"].iloc[-1].date()
     window_return = (df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100
     volume = df["volume"].iloc[-1] if "volume" in df.columns else float("nan")
+    ma_part = "  ".join(
+        f"{col.upper()} {df[col].iloc[-1]:.3f}"
+        for col in MA_WINDOWS
+        if col in df.columns and not pd.isna(df[col].iloc[-1])
+    )
     return (
         f"  {symbol}: {len(df)} 行  {first} ~ {last}  "
         f"最新收盘 {df['close'].iloc[-1]:.3f}  "
         f"成交量 {volume:,.0f} 手  "
         f"区间涨跌 {window_return:+.2f}%"
+        + (f"  {ma_part}" if ma_part else "")
     )
 
 
@@ -536,7 +596,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "symbols", nargs="*", help=f"ETF 代码，省略时默认 {DEFAULT_SYMBOL}（可传多个）"
     )
-    parser.add_argument("--start", help="开始日期，默认一年前（20240101 或 2024-01-01）")
+    parser.add_argument("--start", help="开始日期，默认 2024-01-01（20240101 或 2024-01-01）")
     parser.add_argument("--end", help="结束日期，默认今天")
     parser.add_argument(
         "--adjust",
@@ -582,7 +642,7 @@ def main(argv: list[str] | None = None) -> int:
     symbols: list[str] = args.symbols or [DEFAULT_SYMBOL]
 
     today = date.today()
-    start = parse_date(args.start, today - timedelta(days=365))
+    start = parse_date(args.start, DEFAULT_START)
     end = parse_date(args.end, today)
     if start > end:
         print(f"开始日期 {start} 晚于结束日期 {end}", file=sys.stderr)
@@ -596,6 +656,11 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out)
     failures: list[str] = []
     adjust_label = args.adjust if adjust else "none"
+
+    # 均线预热：向前多抓 130 个日历日，保证请求区间头部的 MA20/MA60 也有值
+    warm_start = (
+        datetime.strptime(start, "%Y%m%d") - timedelta(days=MA_WARMUP_DAYS)
+    ).strftime("%Y%m%d")
 
     cfg: dict | None = None
     if args.to_mysql:
@@ -620,10 +685,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{index + 1}/{len(symbols)}] {symbol} 抓取中 ...")
         try:
             df, used = fetch_daily(
-                symbol, start, end, adjust, source=args.source, retries=args.retries
+                symbol, warm_start, end, adjust, source=args.source, retries=args.retries
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  ! {exc}", file=sys.stderr)
+            failures.append(symbol)
+            continue
+
+        # 用预热数据算均线，再裁剪回用户请求的区间（CSV 与入库均不含预热行）
+        df = add_moving_averages(df)
+        lo, hi = pd.to_datetime(dashed(start)), pd.to_datetime(dashed(end))
+        df = df.loc[(df["date"] >= lo) & (df["date"] <= hi)].reset_index(drop=True)
+        if df.empty:
+            print(f"  ! {symbol} 在 {start}-{end} 区间没有数据", file=sys.stderr)
             failures.append(symbol)
             continue
 
