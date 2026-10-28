@@ -114,6 +114,11 @@ OUTPUT_ORDER = [
     "change",
     "turnover",
 ]
+
+# 这几个列没有任何抓取源稳定提供（amplitude 靠存储过程用 OHLC 推导、turnover 需外部份额）。
+# 重跑时若本次抓取值为 NULL，保留库里已有的值，否则会把算好的结果覆盖回 NULL。
+KEEP_WHEN_SOURCE_NULL = {"amplitude", "turnover"}
+
 ADJUST_CHOICES = {"none": "", "qfq": "qfq", "hfq": "hfq"}
 ADJUST_CODE = {"": "0", "qfq": "1", "hfq": "2"}
 TX_ADJUST_KEY = {"": "day", "qfq": "qfqday", "hfq": "hfqday"}
@@ -742,7 +747,10 @@ def upsert_to_mysql(df: pd.DataFrame, symbol: str, adjust: str, cfg: dict) -> tu
 
     table = cfg["table"]
     placeholders = ", ".join(["%s"] * len(MYSQL_COLUMNS))
-    updates = ", ".join(f"{c}=VALUES({c})" for c in MYSQL_UPDATE)
+    updates = ", ".join(
+        f"{c}=COALESCE(VALUES({c}), {c})" if c in KEEP_WHEN_SOURCE_NULL else f"{c}=VALUES({c})"
+        for c in MYSQL_UPDATE
+    )
     sql = (
         f"INSERT INTO `{table}` ({', '.join(MYSQL_COLUMNS)}) VALUES ({placeholders}) "
         f"ON DUPLICATE KEY UPDATE {updates}"

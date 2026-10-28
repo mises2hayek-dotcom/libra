@@ -285,16 +285,17 @@ def main(argv: list[str] | None = None) -> int:
     if cnt:
         limit = max(1, args.tail)
         rows = q(conn, f"SELECT trade_date, open, high, low, close, pct_change, volume, "
-                       f"ma5, ma20, ma60, bb_lower, bb_mid, bb_upper, dist_to_lower, band_pos "
+                       f"ma5, ma20, ma60, bb_lower, bb_mid, bb_upper, dist_to_lower, band_pos, "
+                       f"amplitude "
                        f"FROM `{db}`.`{table}` WHERE symbol = %s "
                        f"ORDER BY trade_date DESC LIMIT %s", (args.symbol, limit))
         print(f"\n--- 最近 {len(rows)} 个交易日（trade_date 降序）---")
-        header = (f"  {'日期':<11}{'开':>7}{'高':>7}{'低':>7}{'收':>7}{'涨跌%':>7}"
+        header = (f"  {'日期':<11}{'开':>7}{'高':>7}{'低':>7}{'收':>7}{'涨跌%':>7}{'振幅%':>7}"
                   f"{'量(手)':>11}{'MA5':>7}{'MA20':>7}{'MA60':>7}")
         print(header)
-        for (d, o, h, l, c, p, v, m5, m20, m60, bl, bm, bu, dl, bp) in rows:
+        for (d, o, h, l, c, p, v, m5, m20, m60, bl, bm, bu, dl, bp, amp) in rows:
             print(f"  {str(d):<11}{fnum(o):>7}{fnum(h):>7}{fnum(l):>7}{fnum(c):>7}"
-                  f"{fnum(p):>7}{int(v or 0):>11,}"
+                  f"{fnum(p):>7}{fnum(amp):>7}{int(v or 0):>11,}"
                   f"{fnum(m5):>7}{fnum(m20):>7}{fnum(m60):>7}")
             print(f"  {'':<11}BOLL {fnum(bl)} / {fnum(bm)} / {fnum(bu)}"
                   f"   距下轨 {fnum(dl)}  通道位置 {fnum(bp)}")

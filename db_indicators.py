@@ -28,6 +28,7 @@ import getpass
 import os
 import sys
 from pathlib import Path
+from decimal import ROUND_HALF_UP, Decimal
 
 try:
     import pandas as pd
@@ -49,6 +50,7 @@ CHECK_COLUMNS = [
     ("bb_lower", 0.001),
     ("dist_to_lower", 0.001),
     ("band_pos", 0.0002),
+    ("amplitude", 0.001),
 ]
 
 
@@ -189,7 +191,7 @@ def read_frame(conn, cfg: dict, symbol: str, adjust: str) -> pd.DataFrame:
     sql = (
         "SELECT trade_date AS date, open, high, low, close, volume, pct_change, "
         "price_change, ma5, ma20, ma60, bb_upper, bb_mid, bb_lower, "
-        "dist_to_lower, band_pos "
+        "dist_to_lower, band_pos, amplitude "
         f"FROM `{cfg['table']}` WHERE symbol = %s AND adjust = %s ORDER BY trade_date"
     )
     with conn.cursor() as cur:
@@ -206,6 +208,18 @@ def read_frame(conn, cfg: dict, symbol: str, adjust: str) -> pd.DataFrame:
     return df
 
 
+def _amplitude(high, low, prev_close) -> float:
+    """振幅 % = (high - low) / 前收 * 100，十进制四舍五入到 0.001（对齐 MySQL ROUND）。"""
+    if any(pd.isna(v) for v in (high, low, prev_close)) or not prev_close:
+        return float("nan")
+    value = (
+        (Decimal(str(float(high))) - Decimal(str(float(low))))
+        / Decimal(str(float(prev_close)))
+        * 100
+    )
+    return float(value.quantize(Decimal("0.001"), ROUND_HALF_UP))
+
+
 def reference_frame(df: pd.DataFrame) -> pd.DataFrame:
     """用 etf_daily.py 里同一套函数在 pandas 侧重算，作为比对基准。"""
     import etf_daily as etf
@@ -213,6 +227,10 @@ def reference_frame(df: pd.DataFrame) -> pd.DataFrame:
     out = etf.add_moving_averages(df.copy())
     out = etf.add_bollinger(out)
     out = etf.add_band_metrics(out)
+    prev = out["close"].shift(1)
+    out["amplitude"] = [
+        _amplitude(h, l, p) for h, l, p in zip(out["high"], out["low"], prev)
+    ]
     return out
 
 
