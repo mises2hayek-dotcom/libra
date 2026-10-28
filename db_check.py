@@ -94,6 +94,31 @@ MIGRATIONS = [
         "ALTER TABLE `{db}`.`{table}` ADD COLUMN ma60 DECIMAL(10,3) NULL "
         "COMMENT '60日均线' AFTER `ma20`",
     ),
+    (
+        "bb_upper",
+        "ALTER TABLE `{db}`.`{table}` ADD COLUMN bb_upper DECIMAL(10,3) NULL "
+        "COMMENT '布林上线（MA20+2σ）' AFTER `ma60`",
+    ),
+    (
+        "bb_mid",
+        "ALTER TABLE `{db}`.`{table}` ADD COLUMN bb_mid DECIMAL(10,3) NULL "
+        "COMMENT '布林中线（MA20）' AFTER `bb_upper`",
+    ),
+    (
+        "bb_lower",
+        "ALTER TABLE `{db}`.`{table}` ADD COLUMN bb_lower DECIMAL(10,3) NULL "
+        "COMMENT '布林下线（MA20-2σ）' AFTER `bb_mid`",
+    ),
+    (
+        "dist_to_lower",
+        "ALTER TABLE `{db}`.`{table}` ADD COLUMN dist_to_lower DECIMAL(10,3) NULL "
+        "COMMENT '收盘价距布林下轨距离（元）' AFTER `bb_lower`",
+    ),
+    (
+        "band_pos",
+        "ALTER TABLE `{db}`.`{table}` ADD COLUMN band_pos DECIMAL(8,4) NULL "
+        "COMMENT '通道相对位置 0=下轨 1=上轨' AFTER `dist_to_lower`",
+    ),
 ]
 
 

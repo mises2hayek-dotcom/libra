@@ -22,10 +22,17 @@
 | akshare  | 支持 | 齐全               | 原库，东财裸请求             |
 
 输出：<out>/<代码>_<复权>_<开始>_<结束>.csv，UTF-8 BOM 编码，Excel 双击可看。
-列：date, open, close, high, low, volume, amount, amplitude, pct_change, change, turnover, ma5, ma20, ma60
+列：date, open, close, ma5, ma20, ma60, bb_upper, bb_mid, bb_lower,
+　　dist_to_lower, band_pos, high, low, volume, amount, amplitude,
+　　pct_change, change, turnover
 　　volume 统一为「手」（1 手 = 100 份），各源差异在入库前已折算。
-　　ma5/ma20/ma60 为 close 的移动平均。为保证区间头部的均线值准确，
-　　实际抓取会向前多取 130 个日历日做预热，输出时再裁剪回请求区间。
+　　ma5/ma20/ma60 为 close 的移动平均；布林带 bb_mid = MA20，bb_upper/bb_lower
+　　= 中线 ± 2 倍总体标准差（与 TA-Lib 口径一致）；dist_to_lower = close - 下轨，
+　　band_pos = (close - 下轨) / 通道宽度，0=贴下轨 1=贴上轨。
+　　为保证区间头部的指标值准确，实际抓取会向前多取 130 个日历日做预热，
+　　输出时再裁剪回请求区间。
+　　pct_change(涨跌幅 %)/change(涨跌额) 优先用源数据；源未提供（如新浪）
+　　时按相邻交易日 close 补算，因此所有源的这两列都不为空。
 
 MySQL 入库（--to-mysql）
 -----------------------
@@ -84,6 +91,28 @@ COLUMN_ORDER = [
     "change",
     "turnover",
 ]
+# 输出列顺序（CSV 与入库对齐用）：均线紧跟 close，派生列放最后
+OUTPUT_ORDER = [
+    "date",
+    "open",
+    "close",
+    "ma5",
+    "ma20",
+    "ma60",
+    "bb_upper",
+    "bb_mid",
+    "bb_lower",
+    "dist_to_lower",
+    "band_pos",
+    "high",
+    "low",
+    "volume",
+    "amount",
+    "amplitude",
+    "pct_change",
+    "change",
+    "turnover",
+]
 ADJUST_CHOICES = {"none": "", "qfq": "qfq", "hfq": "hfq"}
 ADJUST_CODE = {"": "0", "qfq": "1", "hfq": "2"}
 TX_ADJUST_KEY = {"": "day", "qfq": "qfqday", "hfq": "hfqday"}
@@ -106,6 +135,11 @@ VOLUME_TO_LOT = {
 MA_WINDOWS = {"ma5": 5, "ma20": 20, "ma60": 60}
 # 计算均线用的预热抓取量（日历日）：60 个交易日 ≈ 88 个日历日，留足节假日余量
 MA_WARMUP_DAYS = 130
+
+# 布林带（BOLL）：中线 = N 日均线，上/下线 = 中线 ± K 倍标准差（总体标准差，与 TA-Lib 一致）
+BB_WINDOW = 20
+BB_NUM_STD = 2.0
+BB_COLS = ["bb_upper", "bb_mid", "bb_lower"]
 
 
 def use_direct_connection() -> None:
@@ -202,6 +236,69 @@ def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
     for col, window in MA_WINDOWS.items():
         df[col] = df["close"].rolling(window, min_periods=window).mean().round(3)
     return df
+
+
+def add_bollinger(df: pd.DataFrame) -> pd.DataFrame:
+    """计算布林带：中线 = BB_WINDOW 日均线，上/下线 = 中线 ± BB_NUM_STD 倍标准差。
+
+    标准差用总体标准差（ddof=0），与 TA-Lib/主流行情软件一致；
+    窗口不足 20 日的位置为 NaN（入库转 NULL）。
+    """
+    if df.empty or "close" not in df.columns:
+        return df
+    df = df.copy()
+    mid = df["close"].rolling(BB_WINDOW, min_periods=BB_WINDOW).mean()
+    std = df["close"].rolling(BB_WINDOW, min_periods=BB_WINDOW).std(ddof=0)
+    df["bb_mid"] = mid.round(3)
+    df["bb_upper"] = (mid + BB_NUM_STD * std).round(3)
+    df["bb_lower"] = (mid - BB_NUM_STD * std).round(3)
+    return df
+
+
+def add_band_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """布林带派生指标：
+
+    dist_to_lower = close - bb_lower，收盘价距下轨的距离（元），负值表示跌破下轨；
+    band_pos = (close - bb_lower) / (bb_upper - bb_lower)，通道相对位置，
+               0 = 贴下轨，1 = 贴上轨，可小于 0 或大于 1（破位/超强）。
+    通道宽度为 0（价格长期不变）时 band_pos 无定义，置 NaN（入库 NULL）。
+    """
+    if df.empty or "bb_lower" not in df.columns:
+        return df
+    df = df.copy()
+    df["dist_to_lower"] = (df["close"] - df["bb_lower"]).round(3)
+    width = (df["bb_upper"] - df["bb_lower"])
+    df["band_pos"] = ((df["close"] - df["bb_lower"]) / width.where(width != 0)).round(4)
+    return df
+
+
+def add_price_change(df: pd.DataFrame) -> pd.DataFrame:
+    """计算涨跌幅(%)与涨跌额。源已提供的以其为准，缺的用 close 推导。
+
+    新浪源不带 pct_change/change，这里按相邻交易日收盘价补算：
+        pct_change = (close - 前一日 close) / 前一日 close * 100
+        change     = close - 前一日 close
+    第一行没有前值，留 NaN（入库为 NULL）。
+    """
+    if df.empty or "close" not in df.columns:
+        return df
+    df = df.copy()
+    derived_pct = (df["close"].pct_change() * 100).round(3)
+    derived_chg = df["close"].diff().round(3)
+    if "pct_change" not in df.columns:
+        df["pct_change"] = derived_pct
+    else:
+        df["pct_change"] = pd.to_numeric(df["pct_change"], errors="coerce").fillna(derived_pct)
+    if "change" not in df.columns:
+        df["change"] = derived_chg
+    else:
+        df["change"] = pd.to_numeric(df["change"], errors="coerce").fillna(derived_chg)
+    return df
+
+
+def order_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """按 OUTPUT_ORDER 重排，保证 CSV 与入库列序稳定。"""
+    return df[[c for c in OUTPUT_ORDER if c in df.columns]]
 
 
 def _em_params(symbol: str, start: str, end: str, adjust: str, mid: int) -> dict:
@@ -404,6 +501,11 @@ MYSQL_COLUMNS = [
     "ma5",
     "ma20",
     "ma60",
+    "bb_upper",
+    "bb_mid",
+    "bb_lower",
+    "dist_to_lower",
+    "band_pos",
     "high",
     "low",
     "volume",
@@ -424,6 +526,11 @@ CREATE TABLE IF NOT EXISTS `{table}` (
   ma5          DECIMAL(10,3) NULL COMMENT '5日均线',
   ma20         DECIMAL(10,3) NULL COMMENT '20日均线',
   ma60         DECIMAL(10,3) NULL COMMENT '60日均线',
+  bb_upper     DECIMAL(10,3) NULL COMMENT '布林上线（MA20+2σ）',
+  bb_mid       DECIMAL(10,3) NULL COMMENT '布林中线（MA20）',
+  bb_lower     DECIMAL(10,3) NULL COMMENT '布林下线（MA20-2σ）',
+  dist_to_lower DECIMAL(10,3) NULL COMMENT '收盘价距布林下轨距离（元）',
+  band_pos     DECIMAL(8,4)  NULL COMMENT '通道相对位置 0=下轨 1=上轨',
   high         DECIMAL(10,3) NOT NULL,
   low          DECIMAL(10,3) NOT NULL,
   volume       BIGINT        NOT NULL COMMENT '成交量（手）',
@@ -493,6 +600,11 @@ def upsert_to_mysql(df: pd.DataFrame, symbol: str, adjust: str, cfg: dict) -> tu
             "ma5",
             "ma20",
             "ma60",
+            "bb_upper",
+            "bb_mid",
+            "bb_lower",
+            "dist_to_lower",
+            "band_pos",
             "high",
             "low",
             "volume",
@@ -513,6 +625,11 @@ def upsert_to_mysql(df: pd.DataFrame, symbol: str, adjust: str, cfg: dict) -> tu
             _cell(r.ma5, 3),
             _cell(r.ma20, 3),
             _cell(r.ma60, 3),
+            _cell(r.bb_upper, 3),
+            _cell(r.bb_mid, 3),
+            _cell(r.bb_lower, 3),
+            _cell(r.dist_to_lower, 3),
+            _cell(r.band_pos, 4),
             _cell(r.high, 3),
             _cell(r.low, 3),
             0 if pd.isna(r.volume) else int(r.volume),
@@ -557,12 +674,23 @@ def describe(symbol: str, df: pd.DataFrame) -> str:
         for col in MA_WINDOWS
         if col in df.columns and not pd.isna(df[col].iloc[-1])
     )
+    bb_part = ""
+    if all(c in df.columns for c in BB_COLS) and not pd.isna(df["bb_upper"].iloc[-1]):
+        bb_part = (f"  BOLL {df['bb_lower'].iloc[-1]:.3f} / "
+                   f"{df['bb_mid'].iloc[-1]:.3f} / {df['bb_upper'].iloc[-1]:.3f}")
+    pos_part = ""
+    if "band_pos" in df.columns and not pd.isna(df["band_pos"].iloc[-1]):
+        pos_part = f"  通道位置 {df['band_pos'].iloc[-1]:.2f}"
+    pct = df["pct_change"].iloc[-1] if "pct_change" in df.columns else float("nan")
+    pct_part = "" if pd.isna(pct) else f"  当日涨跌 {pct:+.2f}%"
     return (
         f"  {symbol}: {len(df)} 行  {first} ~ {last}  "
-        f"最新收盘 {df['close'].iloc[-1]:.3f}  "
+        f"最新收盘 {df['close'].iloc[-1]:.3f}{pct_part}  "
         f"成交量 {volume:,.0f} 手  "
         f"区间涨跌 {window_return:+.2f}%"
         + (f"  {ma_part}" if ma_part else "")
+        + bb_part
+        + pos_part
     )
 
 
@@ -692,10 +820,14 @@ def main(argv: list[str] | None = None) -> int:
             failures.append(symbol)
             continue
 
-        # 用预热数据算均线，再裁剪回用户请求的区间（CSV 与入库均不含预热行）
+        # 用预热数据算均线/布林带/涨跌幅，再裁剪回用户请求的区间（CSV 与入库均不含预热行）
         df = add_moving_averages(df)
+        df = add_bollinger(df)
+        df = add_band_metrics(df)
+        df = add_price_change(df)
         lo, hi = pd.to_datetime(dashed(start)), pd.to_datetime(dashed(end))
         df = df.loc[(df["date"] >= lo) & (df["date"] <= hi)].reset_index(drop=True)
+        df = order_columns(df)
         if df.empty:
             print(f"  ! {symbol} 在 {start}-{end} 区间没有数据", file=sys.stderr)
             failures.append(symbol)
