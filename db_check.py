@@ -63,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbol", default="513520", help="统计用的 ETF 代码，默认 513520")
     parser.add_argument("--tail", type=int, default=10,
                         help="按交易日降序展示最近 N 行，默认 10")
+    parser.add_argument("--nulls", action="store_true",
+                        help="统计各列空值行数，用于检查 amount/turnover 等源滞后字段")
     parser.add_argument("--migrate", action="store_true",
                         help="对比预期结构，补齐缺失列（幂等，已存在则跳过）")
     return parser
@@ -296,6 +298,19 @@ def main(argv: list[str] | None = None) -> int:
                   f"{fnum(m5):>7}{fnum(m20):>7}{fnum(m60):>7}")
             print(f"  {'':<11}BOLL {fnum(bl)} / {fnum(bm)} / {fnum(bu)}"
                   f"   距下轨 {fnum(dl)}  通道位置 {fnum(bp)}")
+
+    # 8) 空值统计（检查源滞后字段）
+    if args.nulls:
+        checked = ["amount", "amplitude", "turnover", "pct_change", "price_change",
+                   "ma5", "ma20", "ma60", "bb_upper", "bb_mid", "bb_lower",
+                   "dist_to_lower", "band_pos"]
+        print(f"\n--- 空值统计（{args.symbol}，共 {cnt} 行）---")
+        for column in checked:
+            rows = q(conn, f"SELECT COUNT(*), MAX(trade_date) FROM `{db}`.`{table}` "
+                           f"WHERE symbol = %s AND `{column}` IS NULL", (args.symbol,))
+            nulls, last_null = rows[0][0], rows[0][1]
+            print(f"  {column:<14}{nulls:>6} 行为空"
+                  + (f"   最近为空：{last_null}" if nulls else "   OK"))
 
     conn.close()
     print("\n检查完成。")
