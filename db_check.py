@@ -32,6 +32,24 @@ except ImportError:  # pragma: no cover
     raise SystemExit(1)
 
 
+def load_env_file() -> None:
+    """加载脚本同目录的 .env（KEY=VALUE，已 gitignore），不覆盖已有环境变量。"""
+    from pathlib import Path
+
+    env_path = Path(__file__).resolve().with_name(".env")
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="检查 MySQL 表结构与数据（绕过 SQL 客户端的语句切分问题）",
@@ -43,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mysql-db", help="默认 libra_schema，或 MYSQL_DB")
     parser.add_argument("--mysql-table", default="etf_daily", help="默认 etf_daily")
     parser.add_argument("--symbol", default="513520", help="统计用的 ETF 代码，默认 513520")
+    parser.add_argument("--tail", type=int, default=10,
+                        help="按交易日降序展示最近 N 行，默认 10")
     parser.add_argument("--migrate", action="store_true",
                         help="对比预期结构，补齐缺失列（幂等，已存在则跳过）")
     return parser
@@ -122,6 +142,13 @@ MIGRATIONS = [
 ]
 
 
+def fnum(value, digits: int = 3) -> str:
+    """None 显示为 '-'，其余保留指定小数位。"""
+    if value is None:
+        return "-"
+    return f"{float(value):.{digits}f}"
+
+
 def migrate(conn, db: str, table: str) -> list[str]:
     """按 MIGRATIONS 逐项检查，缺失才执行，返回本次补齐的列名。"""
     existing = {
@@ -141,15 +168,17 @@ def migrate(conn, db: str, table: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_file()
     args = build_parser().parse_args(argv)
     db = args.mysql_db or os.environ.get("MYSQL_DB") or "libra_schema"
     table = args.mysql_table
 
-    password = (
-        args.mysql_password
-        or os.environ.get("MYSQL_PASSWORD")
-        or getpass.getpass(f"MySQL 密码（用户 {args.mysql_user or 'root'}）：")
-    )
+    password = args.mysql_password
+    if password is None:
+        password = os.environ.get("MYSQL_PASSWORD")
+    if password is None:
+        password = getpass.getpass(f"MySQL 密码（用户 {args.mysql_user or 'root'}）：")
+    password = password or ""
 
     try:
         conn = connect(args, password)
@@ -250,15 +279,23 @@ def main(argv: list[str] | None = None) -> int:
     if cnt == 0:
         print("  ! 这个代码没有数据。若抓取时用的是别的代码，用 --symbol 指定。")
 
-    # 7) 最近 3 行
+    # 7) 最近 N 行（按交易日降序）
     if cnt:
-        rows = q(conn, f"SELECT trade_date, open, close, high, low, volume, pct_change "
+        limit = max(1, args.tail)
+        rows = q(conn, f"SELECT trade_date, open, high, low, close, pct_change, volume, "
+                       f"ma5, ma20, ma60, bb_lower, bb_mid, bb_upper, dist_to_lower, band_pos "
                        f"FROM `{db}`.`{table}` WHERE symbol = %s "
-                       f"ORDER BY trade_date DESC LIMIT 3", (args.symbol,))
-        print("\n--- 最近 3 个交易日 ---")
-        print(f"  {'日期':<12}{'开':>8}{'收':>8}{'高':>8}{'低':>8}{'量(手)':>12}{'涨跌%':>9}")
-        for d, o, c, h, l, v, p in rows:
-            print(f"  {str(d):<12}{o:>8}{c:>8}{h:>8}{l:>8}{(v or 0):>12}{('' if p is None else p):>9}")
+                       f"ORDER BY trade_date DESC LIMIT %s", (args.symbol, limit))
+        print(f"\n--- 最近 {len(rows)} 个交易日（trade_date 降序）---")
+        header = (f"  {'日期':<11}{'开':>7}{'高':>7}{'低':>7}{'收':>7}{'涨跌%':>7}"
+                  f"{'量(手)':>11}{'MA5':>7}{'MA20':>7}{'MA60':>7}")
+        print(header)
+        for (d, o, h, l, c, p, v, m5, m20, m60, bl, bm, bu, dl, bp) in rows:
+            print(f"  {str(d):<11}{fnum(o):>7}{fnum(h):>7}{fnum(l):>7}{fnum(c):>7}"
+                  f"{fnum(p):>7}{int(v or 0):>11,}"
+                  f"{fnum(m5):>7}{fnum(m20):>7}{fnum(m60):>7}")
+            print(f"  {'':<11}BOLL {fnum(bl)} / {fnum(bm)} / {fnum(bu)}"
+                  f"   距下轨 {fnum(dl)}  通道位置 {fnum(bp)}")
 
     conn.close()
     print("\n检查完成。")
