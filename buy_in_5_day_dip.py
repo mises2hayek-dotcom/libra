@@ -5,13 +5,13 @@ Rules
 -----
 Let day1..day5 be the last 5 trading days (day5 = today / the as-of date).
 
-1. cumulative 5-day drop: the close of the day before day1 (close0) down to
-   close[day5] must fall by more than 5%: (close5 - close0) / close0 <= -0.05.
+1. cumulative dip: from the close of the day before day1 (close0) down to the
+   LOW of day5 must fall by at least 5%:
+   (low5 - close0) / close0 <= -0.05
+   Using low5 (not close5) captures the intraday flush even if the close
+   recovers - this is also how a gap-up open on day1 is ignored.
    - If not -> "not qualified for buying in 5 day dip strategy."
-2. day5 close must be at least 5% below day1 OPEN:
-   (close5 - open1) / open1 <= -0.05
-   - If not -> not qualified.
-3. Qualified iff day5 close >= day5 open AND day5 close < day4 close
+2. Qualified iff day5 close >= day5 open AND day5 close <= day4 close
    (close back above its own open, while still closing below yesterday).
    - Yes -> "qualified for buying in 5 day dip strategy"
    - No  -> "not qualified for buying in 5 day dip strategy."
@@ -43,7 +43,7 @@ from typing import Iterable, Sequence
 
 DEFAULT_CODE = "513520"
 LOOKBACK = 6            # 5 days of the pattern + 1 extra for context
-DROP_THRESHOLD = -0.05  # "down more than 5%"
+DIP_THRESHOLD = -0.05  # rule 1: (low5 - close0) / close0
 
 QUALIFIED_MSG = "qualified for buying in 5 day dip strategy"
 NOT_QUALIFIED_MSG = "not qualified for buying in 5 day dip strategy."
@@ -189,59 +189,49 @@ class Result:
     message: str
     reason: str
     window: list[Bar]
-    five_day_return: float | None = None
+    dip_return: float | None = None
 
 
-def evaluate(bars: Sequence[Bar], drop_threshold: float = DROP_THRESHOLD) -> Result:
+def evaluate(bars: Sequence[Bar], threshold: float = DIP_THRESHOLD) -> Result:
     """Apply the 5-day dip strategy to the last 5 bars (oldest first).
 
-    Rule 1 needs one extra bar before the window (its close as the cumulative
+    Rule 1 needs one extra bar before the window (its close as the dip
     baseline), so `bars` must contain at least 6 bars.
     """
     if len(bars) < 6:
         raise ValueError(f"need at least 6 daily bars, got {len(bars)}")
 
     window = list(bars[-5:])
-    day1, day5 = window[0], window[-1]
+    day4, day5 = window[-2], window[-1]
     close0 = bars[-6].close
 
-    # 1. cumulative 5-day drop vs the close before the window
-    cum = (day5.close - close0) / close0
-    if cum > drop_threshold:
+    # 1. cumulative dip: close0 -> day5 low must be at least `threshold` down
+    low5 = day5.low if day5.low == day5.low else day5.close  # NaN -> fall back
+    dip = (low5 - close0) / close0
+    if dip > threshold:
         return Result(False, NOT_QUALIFIED_MSG,
-                      f"cumulative 5-day drop {cum:.2%} is not below "
-                      f"{drop_threshold:.0%} "
-                      f"(close0 {close0:.3f} -> day5 close {day5.close:.3f})",
-                      window)
+                      f"cumulative dip {dip:.2%} (close0 {close0:.3f} -> day5 low "
+                      f"{low5:.3f}) is not below {threshold:.1%}",
+                      window, dip)
 
-    # 2. day5 close more than 5% below day1 open
-    ret = (day5.close - day1.open) / day1.open
-    if ret > drop_threshold:
-        return Result(False, NOT_QUALIFIED_MSG,
-                      f"5-day drop {ret:.2%} is not below {drop_threshold:.0%} "
-                      f"(day1 open {day1.open:.3f} -> day5 close {day5.close:.3f})",
-                      window, ret)
-
-    # 3. day5: close >= own open (reversal) AND close < day4 close (still a down day)
-    day4 = window[-2]
+    # 2. day5: close >= own open (reversal) AND close <= day4 close (no breakout)
     if day5.close < day5.open:
         return Result(False, NOT_QUALIFIED_MSG,
-                      f"5-day drop {ret:.2%} qualifies, but today closed at "
+                      f"dip {dip:.2%} qualifies, but today closed at "
                       f"{day5.close:.3f} < open {day5.open:.3f} (no reversal candle)",
-                      window, ret)
-    if day5.close >= day4.close:
+                      window, dip)
+    if day5.close > day4.close:
         return Result(False, NOT_QUALIFIED_MSG,
-                      f"5-day drop {ret:.2%} qualifies and today closed >= open "
-                      f"({day5.close:.3f} >= {day5.open:.3f}), but day5 close is not "
-                      f"below day4 close {day4.close:.3f}",
-                      window, ret)
+                      f"dip {dip:.2%} qualifies and today closed >= open "
+                      f"({day5.close:.3f} >= {day5.open:.3f}), but day5 close is "
+                      f"above day4 close {day4.close:.3f}",
+                      window, dip)
 
     return Result(True, QUALIFIED_MSG,
-                  f"cumulative 5-day drop {cum:.2%} (close0 {close0:.3f}), "
-                  f"drop {ret:.2%} vs day1 open {day1.open:.3f}, "
+                  f"dip {dip:.2%} to day5 low {low5:.3f} (close0 {close0:.3f}), "
                   f"today closed {day5.close:.3f} >= open {day5.open:.3f} "
-                  f"and < day4 close {day4.close:.3f}",
-                  window, ret)
+                  f"and <= day4 close {day4.close:.3f}",
+                  window, dip)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,7 +239,7 @@ def evaluate(bars: Sequence[Bar], drop_threshold: float = DROP_THRESHOLD) -> Res
 # --------------------------------------------------------------------------- #
 def scan_qualified_dates(code: str = DEFAULT_CODE, start_date: str = "",
                          end_date: str | None = None,
-                         drop_threshold: float = DROP_THRESHOLD,
+                         threshold: float = DIP_THRESHOLD,
                          timeout: float = 10.0) -> tuple[list[Result], int]:
     """Evaluate the 5-day dip strategy on every trading day in the range.
 
@@ -270,7 +260,7 @@ def scan_qualified_dates(code: str = DEFAULT_CODE, start_date: str = "",
         if end_date and day > end_date:
             break
         scanned += 1
-        res = evaluate(bars[i - 5:i + 1], drop_threshold=drop_threshold)
+        res = evaluate(bars[i - 5:i + 1], threshold=threshold)
         if res.qualified:
             qualified.append(res)
     return qualified, scanned
@@ -287,14 +277,14 @@ def format_scan_report(code: str, results: Sequence[Result],
         return "\n".join(lines)
     lines.append(f"{'signal date':<14}{'5-day drop':>12}{'detail'}")
     for r in results:
-        drop = "n/a" if r.five_day_return is None else f"{r.five_day_return:+.2%}"
+        drop = "n/a" if r.dip_return is None else f"{r.dip_return:+.2%}"
         lines.append(f"{r.window[-1].date:<14}{drop:>12}  {r.reason}")
     return "\n".join(lines)
 
 
 def performance_report(code: str, start_date: str, days: int = 3,
                        end_date: str | None = None,
-                       drop_threshold: float = DROP_THRESHOLD,
+                       threshold: float = DIP_THRESHOLD,
                        timeout: float = 10.0) -> tuple[str, int]:
     """Report per-day performance of every signal after start_date.
 
@@ -306,8 +296,7 @@ def performance_report(code: str, start_date: str, days: int = 3,
     bars = fetch_bars(code, limit=800, end_date=end_date, timeout=timeout)
     signals = [i for i in range(5, len(bars))
                if bars[i].date >= start_date
-               and evaluate(bars[i - 5:i + 1],
-                            drop_threshold=drop_threshold).qualified]
+               and evaluate(bars[i - 5:i + 1], threshold=threshold).qualified]
 
     span = f"{start_date} ~ {end_date or 'today'}"
     lines = [f"ETF {code} - signal performance [{span}]",
@@ -357,8 +346,8 @@ def format_report(code: str, res: Result) -> str:
         chg_s = "   n/a" if prev is None else f"{chg:+.2f}%"
         lines.append(f"{b.date:<12}{b.open:>8.3f}{b.close:>8.3f}{chg_s:>9}")
         prev = b.close
-    if res.five_day_return is not None:
-        lines.append(f"drop vs day1 open: {res.five_day_return:.2%}")
+    if res.dip_return is not None:
+        lines.append(f"dip vs close0 (to day5 low): {res.dip_return:.2%}")
     lines.append(f"reason: {res.reason}")
     lines.append("")
     lines.append(f"RESULT: {res.message}")
@@ -375,8 +364,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--date", help="as-of date YYYY-MM-DD (default: latest bar)")
     ap.add_argument("--csv", help="read bars from this CSV instead of the network")
     ap.add_argument("--save-csv", help="cache fetched bars to this CSV")
-    ap.add_argument("--threshold", type=float, default=DROP_THRESHOLD,
-                    help="drop threshold as decimal, e.g. -0.05 (default -0.05)")
+    ap.add_argument("--threshold", type=float, default=DIP_THRESHOLD,
+                    help="rule 1 threshold: (low5 - close0) / close0 "
+                         "(default -0.05)")
     ap.add_argument("--scan", metavar="START_DATE",
                     help="scan from START_DATE (YYYY-MM-DD) to --end/--today "
                          "and list every qualified trading date")
@@ -393,11 +383,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.scan is not None:
             results, scanned = scan_qualified_dates(
                 args.code, start_date=args.scan, end_date=args.end,
-                drop_threshold=args.threshold)
+                threshold=args.threshold)
         elif args.after is not None:
             report, n_signals = performance_report(
                 args.code, start_date=args.after, days=args.days,
-                end_date=args.end, drop_threshold=args.threshold)
+                end_date=args.end, threshold=args.threshold)
         else:
             if args.csv:
                 bars = load_bars_csv(args.csv)
@@ -405,7 +395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 bars = fetch_bars(args.code, limit=LOOKBACK, end_date=args.date)
                 if args.save_csv:
                     save_bars_csv(bars, args.save_csv)
-            results, scanned = [evaluate(bars, drop_threshold=args.threshold)], 1
+            results, scanned = [evaluate(bars, threshold=args.threshold)], 1
     except Exception as exc:  # noqa: BLE001 - CLI boundary
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -422,8 +412,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "qualified": r.qualified,
                 "message": r.message,
                 "reason": r.reason,
-                "five_day_return": None if r.five_day_return is None
-                else round(r.five_day_return, 6),
+                "dip_return": None if r.dip_return is None
+                else round(r.dip_return, 6),
                 "window": [b.__dict__ for b in r.window],
             } for r in results],
         }, ensure_ascii=False, indent=2))
