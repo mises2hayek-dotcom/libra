@@ -5,8 +5,8 @@ Rules
 -----
 Let day1..day5 be the last 5 trading days (day5 = today / the as-of date).
 
-1. day1..day5 closing price must keep going down: close[day1] > close[day2]
-   > ... > close[day5].
+1. cumulative 5-day drop: the close of the day before day1 (close0) down to
+   close[day5] must fall by more than 5%: (close5 - close0) / close0 <= -0.05.
    - If not -> "not qualified for buying in 5 day dip strategy."
 2. day5 close must be at least 5% below day1 OPEN:
    (close5 - open1) / open1 <= -0.05
@@ -193,25 +193,25 @@ class Result:
 
 
 def evaluate(bars: Sequence[Bar], drop_threshold: float = DROP_THRESHOLD) -> Result:
-    """Apply the 5-day dip strategy to the last 5 bars (oldest first)."""
-    if len(bars) < 5:
-        raise ValueError(f"need at least 5 daily bars, got {len(bars)}")
+    """Apply the 5-day dip strategy to the last 5 bars (oldest first).
+
+    Rule 1 needs one extra bar before the window (its close as the cumulative
+    baseline), so `bars` must contain at least 6 bars.
+    """
+    if len(bars) < 6:
+        raise ValueError(f"need at least 6 daily bars, got {len(bars)}")
 
     window = list(bars[-5:])
     day1, day5 = window[0], window[-1]
-    closes = [b.close for b in window]
+    close0 = bars[-6].close
 
-    # 1. consecutive 5-day decline: strictly lower close each day
-    declining = all(closes[i] > closes[i + 1] for i in range(len(closes) - 1))
-    if not declining:
-        falling_day = next(
-            f"{window[i].date}->{window[i+1].date} "
-            f"({closes[i]} -> {closes[i+1]})"
-            for i in range(len(closes) - 1) if closes[i] <= closes[i + 1]
-        )
+    # 1. cumulative 5-day drop vs the close before the window
+    cum = (day5.close - close0) / close0
+    if cum > drop_threshold:
         return Result(False, NOT_QUALIFIED_MSG,
-                      f"close price did not fall on 5 consecutive days; "
-                      f"first non-declining step: {falling_day}",
+                      f"cumulative 5-day drop {cum:.2%} is not below "
+                      f"{drop_threshold:.0%} "
+                      f"(close0 {close0:.3f} -> day5 close {day5.close:.3f})",
                       window)
 
     # 2. day5 close more than 5% below day1 open
@@ -237,9 +237,10 @@ def evaluate(bars: Sequence[Bar], drop_threshold: float = DROP_THRESHOLD) -> Res
                       window, ret)
 
     return Result(True, QUALIFIED_MSG,
-                  f"5 consecutive down days, drop {ret:.2%} vs day1 open "
-                  f"{day1.open:.3f}, today closed {day5.close:.3f} "
-                  f"> open {day5.open:.3f}",
+                  f"cumulative 5-day drop {cum:.2%} (close0 {close0:.3f}), "
+                  f"drop {ret:.2%} vs day1 open {day1.open:.3f}, "
+                  f"today closed {day5.close:.3f} >= open {day5.open:.3f} "
+                  f"and < day4 close {day4.close:.3f}",
                   window, ret)
 
 
@@ -262,14 +263,14 @@ def scan_qualified_dates(code: str = DEFAULT_CODE, start_date: str = "",
     bars = fetch_bars(code, limit=800, end_date=end_date, timeout=timeout)
     qualified: list[Result] = []
     scanned = 0
-    for i in range(4, len(bars)):
+    for i in range(5, len(bars)):
         day = bars[i].date
         if start_date and day < start_date:
             continue
         if end_date and day > end_date:
             break
         scanned += 1
-        res = evaluate(bars[i - 4:i + 1], drop_threshold=drop_threshold)
+        res = evaluate(bars[i - 5:i + 1], drop_threshold=drop_threshold)
         if res.qualified:
             qualified.append(res)
     return qualified, scanned
@@ -303,9 +304,9 @@ def performance_report(code: str, start_date: str, days: int = 3,
     """
     # 800 bars ~= 3+ years of trading days; enough context before start_date
     bars = fetch_bars(code, limit=800, end_date=end_date, timeout=timeout)
-    signals = [i for i in range(4, len(bars))
+    signals = [i for i in range(5, len(bars))
                if bars[i].date >= start_date
-               and evaluate(bars[i - 4:i + 1],
+               and evaluate(bars[i - 5:i + 1],
                             drop_threshold=drop_threshold).qualified]
 
     span = f"{start_date} ~ {end_date or 'today'}"
