@@ -11,8 +11,9 @@ Let day1..day5 be the last 5 trading days (day5 = today / the as-of date).
    Using low5 (not close5) captures the intraday flush even if the close
    recovers - this is also how a gap-up open on day1 is ignored.
    - If not -> "not qualified for buying in 5 day dip strategy."
-2. Qualified iff day5 close >= day5 open AND day5 close <= day4 close
-   (close back above its own open, while still closing below yesterday).
+2. day5 close >= day5 open AND day5 close <= day4 close
+   (close back above its own open, but not above yesterday's close).
+   - If not -> not qualified.
    - Yes -> "qualified for buying in 5 day dip strategy"
    - No  -> "not qualified for buying in 5 day dip strategy."
 
@@ -42,7 +43,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 DEFAULT_CODE = "513520"
-LOOKBACK = 6            # 5 days of the pattern + 1 extra for context
+LOOKBACK = 6           # 5 days of the pattern + 1 bar for the dip baseline
 DIP_THRESHOLD = -0.05  # rule 1: (low5 - close0) / close0
 
 QUALIFIED_MSG = "qualified for buying in 5 day dip strategy"
@@ -260,7 +261,7 @@ def scan_qualified_dates(code: str = DEFAULT_CODE, start_date: str = "",
         if end_date and day > end_date:
             break
         scanned += 1
-        res = evaluate(bars[i - 5:i + 1], threshold=threshold)
+        res = evaluate(bars[:i + 1], threshold=threshold)
         if res.qualified:
             qualified.append(res)
     return qualified, scanned
@@ -296,7 +297,7 @@ def performance_report(code: str, start_date: str, days: int = 3,
     bars = fetch_bars(code, limit=800, end_date=end_date, timeout=timeout)
     signals = [i for i in range(5, len(bars))
                if bars[i].date >= start_date
-               and evaluate(bars[i - 5:i + 1], threshold=threshold).qualified]
+               and evaluate(bars[:i + 1], threshold=threshold).qualified]
 
     span = f"{start_date} ~ {end_date or 'today'}"
     lines = [f"ETF {code} - signal performance [{span}]",
