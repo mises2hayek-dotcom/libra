@@ -6,7 +6,8 @@
 1. 遍历某标的全部日线，挑出「当日跌幅 >= 阈值」的交易日作为信号日 T0
    （默认 -2%，即 pct_change <= -2.00%）。
 2. 取信号日之后第 H 个交易日（默认第 1 个，即 T+1）的行情数据。
-3. 比较 T0 的**开盘价**与 TH 的**收盘价**，输出涨跌额与涨跌幅%。
+3. 比较 T0 的**开盘价**与 TH 的价格，输出涨跌额与涨跌幅%。
+   默认按**开盘对开盘**（--compare open）；加 --compare close 则用 TH 收盘价。
 
 数据来源：本地 MySQL（表 stock_daily / etf_daily，连接参数从 .env 读取）。
 
@@ -15,7 +16,8 @@
     python dip_day_analysis.py                       # 600276，跌 2%+，看 T+1
     python dip_day_analysis.py 300750                # 另一只
     python dip_day_analysis.py 600276 --threshold -3   # 跌 3%+ 才算信号
-    python dip_day_analysis.py 600276 --horizon 3      # 看 T+3（原默认值）
+    python dip_day_analysis.py 600276 --horizon 3      # 看 T+3
+    python dip_day_analysis.py 600276 --compare close   # 改为 开盘 -> 收盘 口径
     python dip_day_analysis.py 600276 --start 2026-01-01 --end 2026-10-31
     python dip_day_analysis.py 600276 --csv out.csv    # 导出明细
     python dip_day_analysis.py 600276 --json           # JSON 输出
@@ -90,6 +92,8 @@ class Bar:
 class Signal:
     t0: Bar
     tn: Bar
+    basis: str      # 对比价字段: "open" / "close"
+    ref: float      # T+H 被比较的价格
     diff: float
     pct: float
 
@@ -132,8 +136,12 @@ def fill_missing_pct(all_bars: list[Bar]) -> None:
 # 核心逻辑
 # --------------------------------------------------------------------------- #
 def find_signals(all_bars: list[Bar], threshold: float, horizon: int,
-                 start: str | None, end: str | None) -> tuple[list[Signal], int]:
-    """返回 (信号列表, 因样本不足而跳过的信号数)。"""
+                 start: str | None, end: str | None,
+                 basis: str = "open") -> tuple[list[Signal], int]:
+    """返回 (信号列表, 因样本不足而跳过的信号数)。
+
+    basis 决定 T+H 用哪个价格与 T0 开盘价比较：open = 开盘对开盘，close = 开盘对收盘。
+    """
     signals: list[Signal] = []
     skipped = 0
     for i, b in enumerate(all_bars):
@@ -148,8 +156,10 @@ def find_signals(all_bars: list[Bar], threshold: float, horizon: int,
             skipped += 1          # 尾部信号没有足够的后续交易日
             continue
         tn = all_bars[j]
-        diff = tn.close - b.open
-        signals.append(Signal(t0=b, tn=tn, diff=diff, pct=diff / b.open * 100))
+        ref = tn.open if basis == "open" else tn.close
+        diff = ref - b.open
+        signals.append(Signal(t0=b, tn=tn, basis=basis, ref=ref,
+                              diff=diff, pct=diff / b.open * 100))
     return signals, skipped
 
 
@@ -167,27 +177,31 @@ def _pad(text: str, width: int, align: str = "left") -> str:
 
 
 def format_report(symbol: str, signals: list[Signal], threshold: float,
-                  horizon: int, skipped: int, total: int) -> str:
+                  horizon: int, skipped: int, total: int, basis: str) -> str:
+    basis_cn = "开盘价" if basis == "open" else "收盘价"
     lines = [
         f"{symbol}  T0 大跌 -> T+{horizon} 表现",
         f"信号条件：当日涨跌幅 <= {threshold:.2f}%（共扫描 {total} 个交易日）",
-        f"对比口径：T0 开盘价  ->  T+{horizon} 收盘价",
+        f"对比口径：T0 开盘价  ->  T+{horizon} {basis_cn}（涨跌额/涨跌幅按此计算）",
         "",
     ]
     if not signals:
         lines.append("没有符合条件的交易日")
         return "\n".join(lines)
 
+    h = horizon
     spec = [("T0 日期", 12, "l"), ("T0 开", 9, "r"), ("T0 跌%", 8, "r"),
-            (f"T+{horizon} 日期", 13, "l"), (f"T+{horizon} 收", 10, "r"),
-            ("涨跌额", 9, "r"), ("涨跌%", 9, "r")]
+            (f"T+{h} 日期", 13, "l"), (f"T+{h} 开", 9, "r"), (f"T+{h} 高", 9, "r"),
+            (f"T+{h} 低", 9, "r"), (f"T+{h} 收", 9, "r"),
+            (f"对比{basis_cn[:2]}", 10, "r"), ("涨跌额", 9, "r"), ("涨跌%", 9, "r")]
     head = "".join(_pad(t, w, a) for t, w, a in spec)
     lines.append(head)
     lines.append("-" * _dw(head))
     for s in signals:
         cells = [s.t0.date, f"{s.t0.open:.3f}", f"{s.t0.pct:.2f}",
-                 s.tn.date, f"{s.tn.close:.3f}",
-                 f"{s.diff:+.3f}", f"{s.pct:+.2f}%"]
+                 s.tn.date, f"{s.tn.open:.3f}", f"{s.tn.high:.3f}",
+                 f"{s.tn.low:.3f}", f"{s.tn.close:.3f}",
+                 f"{s.ref:.3f}", f"{s.diff:+.3f}", f"{s.pct:+.2f}%"]
         lines.append("".join(_pad(c, w, a) for c, (_, w, a) in zip(cells, spec)))
 
     rets = [s.pct for s in signals]
@@ -209,13 +223,14 @@ def save_csv(signals: list[Signal], horizon: int, path: str) -> None:
         w.writerow(["t0_date", "t0_open", "t0_high", "t0_low", "t0_close", "t0_pct",
                     f"t{horizon}_date", f"t{horizon}_open", f"t{horizon}_high",
                     f"t{horizon}_low", f"t{horizon}_close",
-                    "diff", "pct"])
+                    "basis", "ref_price", "diff", "pct"])
         for s in signals:
             w.writerow([s.t0.date, f"{s.t0.open:.3f}", f"{s.t0.high:.3f}",
                         f"{s.t0.low:.3f}", f"{s.t0.close:.3f}",
                         "" if s.t0.pct is None else f"{s.t0.pct:.3f}",
                         s.tn.date, f"{s.tn.open:.3f}", f"{s.tn.high:.3f}",
                         f"{s.tn.low:.3f}", f"{s.tn.close:.3f}",
+                        s.basis, f"{s.ref:.3f}",
                         f"{s.diff:+.3f}", f"{s.pct:+.4f}"])
 
 
@@ -227,6 +242,9 @@ def main(argv=None) -> int:
                     help=f"当日跌幅阈值（%%，默认 {DEFAULT_THRESHOLD}）")
     ap.add_argument("--horizon", type=int, default=DEFAULT_HORIZON,
                     help=f"向后看第几个交易日（默认 {DEFAULT_HORIZON}）")
+    ap.add_argument("--compare", choices=("open", "close"), default="open",
+                    help="T+H 与 T0 开盘价比较时用哪个价：open=开盘对开盘（默认），"
+                         "close=开盘对收盘")
     ap.add_argument("--table", default=DEFAULT_TABLE,
                     help=f"数据表（默认 {DEFAULT_TABLE}；ETF 用 etf_daily）")
     ap.add_argument("--start", help="信号日下限 YYYY-MM-DD")
@@ -260,7 +278,7 @@ def main(argv=None) -> int:
 
     fill_missing_pct(all_bars)
     signals, skipped = find_signals(all_bars, args.threshold, args.horizon,
-                                    args.start, args.end)
+                                    args.start, args.end, basis=args.compare)
 
     if args.json:
         print(json.dumps({
@@ -268,18 +286,21 @@ def main(argv=None) -> int:
             "table": args.table,
             "threshold": args.threshold,
             "horizon": args.horizon,
+            "compare": args.compare,
             "scanned": len(all_bars),
             "skipped": skipped,
             "signals": [{
                 "t0_date": s.t0.date, "t0_open": s.t0.open, "t0_pct": s.t0.pct,
                 f"t{args.horizon}_date": s.tn.date,
+                f"t{args.horizon}_open": s.tn.open,
                 f"t{args.horizon}_close": s.tn.close,
+                "ref_price": round(s.ref, 3),
                 "diff": round(s.diff, 3), "pct": round(s.pct, 4),
             } for s in signals],
         }, ensure_ascii=False, indent=2))
     else:
         print(format_report(args.symbol, signals, args.threshold, args.horizon,
-                            skipped, len(all_bars)))
+                            skipped, len(all_bars), args.compare))
         if args.csv:
             save_csv(signals, args.horizon, args.csv)
             print(f"\n明细已导出：{args.csv}")
