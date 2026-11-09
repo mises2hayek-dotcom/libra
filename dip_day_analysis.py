@@ -12,13 +12,13 @@
 
 用法
 -----
-    python dip_t3_analysis.py                       # 600276，跌 2%+，看 T+1
-    python dip_t3_analysis.py 300750                # 另一只
-    python dip_t3_analysis.py 600276 --threshold -3   # 跌 3%+ 才算信号
-    python dip_t3_analysis.py 600276 --horizon 3      # 看 T+3（原默认值）
-    python dip_t3_analysis.py 600276 --start 2026-01-01 --end 2026-10-31
-    python dip_t3_analysis.py 600276 --csv out.csv    # 导出明细
-    python dip_t3_analysis.py 600276 --json           # JSON 输出
+    python dip_day_analysis.py                       # 600276，跌 2%+，看 T+1
+    python dip_day_analysis.py 300750                # 另一只
+    python dip_day_analysis.py 600276 --threshold -3   # 跌 3%+ 才算信号
+    python dip_day_analysis.py 600276 --horizon 3      # 看 T+3（原默认值）
+    python dip_day_analysis.py 600276 --start 2026-01-01 --end 2026-10-31
+    python dip_day_analysis.py 600276 --csv out.csv    # 导出明细
+    python dip_day_analysis.py 600276 --json           # JSON 输出
 """
 
 from __future__ import annotations
