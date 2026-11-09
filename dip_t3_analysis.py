@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""T0 大跌 -> T+H 表现分析（默认 H=3）。
+"""T0 大跌 -> T+H 表现分析（默认 H=1，即 T+1）。
 
 规则
 ----
 1. 遍历某标的全部日线，挑出「当日跌幅 >= 阈值」的交易日作为信号日 T0
    （默认 -2%，即 pct_change <= -2.00%）。
-2. 取信号日之后第 H 个交易日（默认第 3 个，即 T+3）的行情数据。
+2. 取信号日之后第 H 个交易日（默认第 1 个，即 T+1）的行情数据。
 3. 比较 T0 的**开盘价**与 TH 的**收盘价**，输出涨跌额与涨跌幅%。
 
 数据来源：本地 MySQL（表 stock_daily / etf_daily，连接参数从 .env 读取）。
 
 用法
 -----
-    python dip_t3_analysis.py                       # 600276，跌 2%+，看 T+3
+    python dip_t3_analysis.py                       # 600276，跌 2%+，看 T+1
     python dip_t3_analysis.py 300750                # 另一只
     python dip_t3_analysis.py 600276 --threshold -3   # 跌 3%+ 才算信号
-    python dip_t3_analysis.py 600276 --horizon 5      # 看 T+5
+    python dip_t3_analysis.py 600276 --horizon 3      # 看 T+3（原默认值）
     python dip_t3_analysis.py 600276 --start 2026-01-01 --end 2026-10-31
     python dip_t3_analysis.py 600276 --csv out.csv    # 导出明细
     python dip_t3_analysis.py 600276 --json           # JSON 输出
@@ -34,7 +34,7 @@ from pathlib import Path
 
 DEFAULT_SYMBOL = "600276"
 DEFAULT_THRESHOLD = -2.0   # 当日跌幅阈值（%），<= 此值即信号
-DEFAULT_HORIZON = 3        # 向后看第 H 个交易日
+DEFAULT_HORIZON = 1        # 向后看第 H 个交易日（1 = 次日 T+1）
 DEFAULT_TABLE = "stock_daily"
 
 
