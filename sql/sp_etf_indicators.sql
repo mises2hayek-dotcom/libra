@@ -5,7 +5,7 @@
 --   p_symbol   ETF 代码；NULL 或 '' 表示全部标的
 --   p_adjust   复权类型 none/qfq/hfq；NULL 或 '' 表示全部
 --   p_fill_pct 1 = 用相邻交易日收盘补齐缺失的 pct_change / price_change，0 = 不补
---              （amplitude 不受此开关影响：任何源都没有稳定的振幅字段，见下）
+--              （amplitude 不受此开关影响，见下）
 --
 -- 口径（与 etf_daily.py 的 add_moving_averages / add_bollinger / add_band_metrics 一致）
 --   ma5/ma20/ma60 = 最近 N 个交易日收盘均值，不足 N 日返回 NULL（对齐 pandas min_periods=N）
@@ -14,7 +14,7 @@
 --   bb_lower      = ma20 - 2 * STDDEV_POP(close, 20)
 --   dist_to_lower = close - bb_lower                      -- 用已取整到 0.001 的 bb_lower
 --   band_pos      = (close - bb_lower) / (bb_upper - bb_lower)   通道宽度为 0 时 NULL
---   amplitude     = (high - low) / 前收 * 100              -- 振幅 %，源不提供时用 OHLC 推导
+--   amplitude     = (high - low) / 前收 * 100              -- 振幅 %，统一按序列内 OHLC 推导
 --   pct_change    = (close - 前收) / 前收 * 100
 --   price_change  = close - 前收
 --
@@ -144,19 +144,20 @@ BEGIN
            AND (t.pct_change IS NULL OR t.price_change IS NULL);
     END IF;
 
-    -- 振幅 %：新浪/腾讯源都不返回该字段，东财才有，所以只用 OHLC 推导补 NULL，
-    -- 不覆盖数据源原始值。序列首个交易日没有前收，保持 NULL（无法推导）。
+    -- 振幅 %：纯 OHLC 派生量，直接覆盖重算（不走「只补 NULL」）。
+    -- 原因：东财自带的振幅按原始昨收计算且只保留 2 位小数，在复权序列里口径
+    -- 对不上；统一用本序列的 (high-low)/prev_close*100 推导，精度 3 位。
+    -- 序列首个交易日没有前收，置 NULL（无法推导）。
     UPDATE etf_daily t
       JOIN tmp_etf_prev p
         ON p.symbol     = t.symbol
        AND p.adjust     = t.adjust
        AND p.trade_date = t.trade_date
-       SET t.amplitude = ROUND((t.high - t.low) / p.prev_close * 100, 3)
-     WHERE p.prev_close IS NOT NULL
-       AND p.prev_close <> 0
-       AND t.high IS NOT NULL
-       AND t.low  IS NOT NULL
-       AND t.amplitude IS NULL;
+       SET t.amplitude = CASE
+             WHEN p.prev_close IS NULL OR p.prev_close = 0
+                  OR t.high IS NULL OR t.low IS NULL THEN NULL
+             ELSE ROUND((t.high - t.low) / p.prev_close * 100, 3)
+           END;
 
     DROP TEMPORARY TABLE IF EXISTS tmp_etf_prev;
 

@@ -179,13 +179,17 @@ def em_secid(symbol: str, mid: int) -> str:
 
 
 def em_market_id(symbol: str) -> int:
-    """东财 secid 的市场号：1=上交所，0=深交所。"""
-    return 1 if symbol[0] in "56" else 0
+    """东财 secid 的市场号：1=上交所，0=深交所。
+
+    5/9 开头=沪市基金/B股，6 开头=沪市股票；0/1/3 开头=深市股票/基金。
+    同时覆盖 ETF（513520/159915）与 A 股个股（600276/300750）。
+    """
+    return 1 if symbol[0] in "569" else 0
 
 
 def prefixed(symbol: str) -> str:
     """新浪/腾讯需要 sh/sz 前缀。"""
-    return ("sh" if symbol[0] in "56" else "sz") + symbol
+    return ("sh" if symbol[0] in "569" else "sz") + symbol
 
 
 def parse_date(value: str | None, default: date) -> str:
@@ -855,8 +859,10 @@ def _procedure_body(sql_text: str) -> str:
     return "\n".join(lines).strip().rstrip(";")
 
 
-def ensure_indicators_proc(cfg: dict, force: bool = False) -> bool:
-    """确保 sp_etf_indicators 存在；force=True 时先 DROP 再建。返回是否本次创建。"""
+def ensure_indicators_proc(
+    cfg: dict, force: bool = False, proc_name: str = PROC_NAME
+) -> bool:
+    """确保存储过程存在；force=True 时先 DROP 再建。返回是否本次创建。"""
     conn = _connect(cfg, autocommit=True)
     try:
         with conn.cursor() as cur:
@@ -864,15 +870,15 @@ def ensure_indicators_proc(cfg: dict, force: bool = False) -> bool:
                 "SELECT COUNT(*) FROM information_schema.routines "
                 "WHERE routine_schema = %s AND routine_name = %s "
                 "AND routine_type = 'PROCEDURE'",
-                (cfg["database"], PROC_NAME),
+                (cfg["database"], proc_name),
             )
             exists = cur.fetchone()[0] > 0
             if exists and not force:
                 return False
-            sql_path = SQL_DIR / f"{PROC_NAME}.sql"
+            sql_path = SQL_DIR / f"{proc_name}.sql"
             if not sql_path.is_file():
                 raise RuntimeError(f"缺少存储过程定义文件：{sql_path}")
-            cur.execute(f"DROP PROCEDURE IF EXISTS `{PROC_NAME}`")
+            cur.execute(f"DROP PROCEDURE IF EXISTS `{proc_name}`")
             cur.execute(_procedure_body(sql_path.read_text(encoding="utf-8")))
     finally:
         conn.close()
@@ -884,13 +890,14 @@ def apply_indicators(
     symbol: str | None = None,
     adjust: str | None = None,
     fill_pct: bool = True,
+    proc_name: str = PROC_NAME,
 ) -> dict:
     """调用存储过程在库内重算指标，返回过程回执。"""
     conn = _connect(cfg, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                f"CALL `{PROC_NAME}`(%s, %s, %s)",
+                f"CALL `{proc_name}`(%s, %s, %s)",
                 (symbol, adjust, 1 if fill_pct else 0),
             )
             row = cur.fetchone()

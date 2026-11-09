@@ -96,6 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
     db.add_argument("--mysql-password", help="建议改用 .env 里的 MYSQL_PASSWORD")
     db.add_argument("--mysql-db", help="默认 libra_schema，或 MYSQL_DB")
     db.add_argument("--mysql-table", default="etf_daily", help="默认 etf_daily")
+    db.add_argument("--proc", default=PROC_NAME,
+                    help="存储过程名，默认 sp_etf_indicators（个股用 sp_stock_indicators）")
     return parser
 
 
@@ -135,40 +137,41 @@ def procedure_body(sql_text: str) -> str:
     return "\n".join(lines).strip().rstrip(";")
 
 
-def proc_exists(conn, database: str) -> bool:
+def proc_exists(conn, database: str, proc_name: str) -> bool:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT COUNT(*) FROM information_schema.routines "
             "WHERE routine_schema = %s AND routine_name = %s AND routine_type = 'PROCEDURE'",
-            (database, PROC_NAME),
+            (database, proc_name),
         )
         return cur.fetchone()[0] > 0
 
 
-def cmd_create(conn, cfg: dict, force: bool) -> int:
-    if proc_exists(conn, cfg["database"]) and not force:
-        print(f"[跳过] {cfg['database']}.{PROC_NAME} 已存在；要重建请加 --force")
+def cmd_create(conn, cfg: dict, force: bool, proc_name: str) -> int:
+    if proc_exists(conn, cfg["database"], proc_name) and not force:
+        print(f"[跳过] {cfg['database']}.{proc_name} 已存在；要重建请加 --force")
         return 0
-    sql_path = SQL_DIR / f"{PROC_NAME}.sql"
+    sql_path = SQL_DIR / f"{proc_name}.sql"
     if not sql_path.is_file():
         print(f"[失败] 找不到定义文件 {sql_path}", file=sys.stderr)
         return 1
     with conn.cursor() as cur:
-        cur.execute(f"DROP PROCEDURE IF EXISTS `{PROC_NAME}`")
+        cur.execute(f"DROP PROCEDURE IF EXISTS `{proc_name}`")
         cur.execute(procedure_body(sql_path.read_text(encoding="utf-8")))
-    print(f"[建过程] {cfg['database']}.{PROC_NAME} 创建成功")
+    print(f"[建过程] {cfg['database']}.{proc_name} 创建成功")
     return 0
 
 
-def cmd_drop(conn, cfg: dict) -> int:
+def cmd_drop(conn, cfg: dict, proc_name: str) -> int:
     with conn.cursor() as cur:
-        cur.execute(f"DROP PROCEDURE IF EXISTS `{PROC_NAME}`")
-    print(f"[删除] {cfg['database']}.{PROC_NAME}")
+        cur.execute(f"DROP PROCEDURE IF EXISTS `{proc_name}`")
+    print(f"[删除] {cfg['database']}.{proc_name}")
     return 0
 
 
 def cmd_apply(conn, cfg: dict, args: argparse.Namespace) -> int:
-    if not proc_exists(conn, cfg["database"]):
+    proc_name = args.proc
+    if not proc_exists(conn, cfg["database"], proc_name):
         print("[失败] 存储过程不存在，先跑 --create", file=sys.stderr)
         return 1
     symbol = args.symbol
@@ -177,7 +180,7 @@ def cmd_apply(conn, cfg: dict, args: argparse.Namespace) -> int:
           f"fill_pct={0 if args.no_fill_pct else 1}")
     with conn.cursor() as cur:
         cur.execute(
-            f"CALL `{PROC_NAME}`(%s, %s, %s)",
+            f"CALL `{proc_name}`(%s, %s, %s)",
             (symbol, adjust, 0 if args.no_fill_pct else 1),
         )
         row = cur.fetchone()
@@ -318,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
               f"表 {cfg['table']}")
 
         if args.drop:
-            return cmd_drop(conn, cfg)
+            return cmd_drop(conn, cfg, args.proc)
 
         actions = {
             "create": args.create,
@@ -329,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             actions = dict.fromkeys(actions, True)
 
         if actions["create"]:
-            rc = cmd_create(conn, cfg, args.force)
+            rc = cmd_create(conn, cfg, args.force, args.proc)
             if rc:
                 return rc
         if actions["apply"]:
