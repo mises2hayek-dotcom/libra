@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Buy-in 5-day dip strategy checker for A-share ETFs.
+"""Buy-in 5-day dip strategy checker for A-shares (ETFs and stocks).
 
 Rules
 -----
@@ -17,17 +17,23 @@ Let day1..day5 be the last 5 trading days (day5 = today / the as-of date).
    - Yes -> "qualified for buying in 5 day dip strategy"
    - No  -> "not qualified for buying in 5 day dip strategy."
 
-Data source: Eastmoney public daily K-line endpoint (no auth, stdlib only).
+The rules are purely price-based, so they apply unchanged to ETFs and to
+individual A-share stocks (main board, ChiNext, STAR).
+
+Data source: Eastmoney public daily K-line endpoint (no auth, stdlib only),
+Tencent as fallback. Both return forward-adjusted (qfq) prices.
 
 Usage
 -----
-    python buy_in_5_day_dip.py                 # 513520, latest trading day
-    python buy_in_5_day_dip.py 510300          # another ETF
-    python buy_in_5_day_dip.py 513520 --date 2026-10-29   # as-of a past date
-    python buy_in_5_day_dip.py 513520 --scan 2026-01-01   # list all qualified dates
-    python buy_in_5_day_dip.py 513520 --scan 2026-01-01 --end 2026-06-30
-    python buy_in_5_day_dip.py 513520 --after 2026-01-01 --days 3  # signal performance
-    python buy_in_5_day_dip.py 513520 --csv bars.csv      # offline / from file
+    python buy_in_5_day_dip.py                 # 600276 + 300750, latest trading day
+    python buy_in_5_day_dip.py 600276          # one stock
+    python buy_in_5_day_dip.py 600276 300750   # several codes in one run
+    python buy_in_5_day_dip.py 513520          # ETFs still work the same way
+    python buy_in_5_day_dip.py 600276 --date 2026-10-29   # as-of a past date
+    python buy_in_5_day_dip.py 600276 --scan 2026-01-01   # list all qualified dates
+    python buy_in_5_day_dip.py 600276 --scan 2026-01-01 --end 2026-06-30
+    python buy_in_5_day_dip.py 600276 --after 2026-01-01 --days 3  # signal performance
+    python buy_in_5_day_dip.py 600276 --csv bars.csv      # offline / from file
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
-DEFAULT_CODE = "513520"
+DEFAULT_CODES = ("600276", "300750")  # 恒瑞医药 / 宁德时代
 LOOKBACK = 6           # 5 days of the pattern + 1 bar for the dip baseline
 DIP_THRESHOLD = -0.05  # rule 1: (low5 - close0) / close0
 
@@ -64,7 +70,11 @@ class Bar:
 # data access
 # --------------------------------------------------------------------------- #
 def _eastmoney_secid(code: str) -> str:
-    """Market prefix used by Eastmoney: 1 = Shanghai, 0 = Shenzhen."""
+    """Market prefix used by Eastmoney: 1 = Shanghai, 0 = Shenzhen.
+
+    Covers both ETFs (5xx/1xx) and stocks (60x = SH main board,
+    00x/30x = SZ main board / ChiNext, 68x = STAR market).
+    """
     code = code.strip()
     if code[0] in "569" or code.startswith("11"):
         return f"1.{code}"
@@ -138,7 +148,7 @@ def _fetch_tencent(code: str, limit: int, end_date: str | None,
     return bars
 
 
-def fetch_bars(code: str = DEFAULT_CODE, limit: int = LOOKBACK,
+def fetch_bars(code: str = DEFAULT_CODES[0], limit: int = LOOKBACK,
                end_date: str | None = None, timeout: float = 10.0) -> list[Bar]:
     """Fetch the last `limit` daily bars, oldest first (last element = as-of day).
 
@@ -238,7 +248,7 @@ def evaluate(bars: Sequence[Bar], threshold: float = DIP_THRESHOLD) -> Result:
 # --------------------------------------------------------------------------- #
 # scan: find every qualified trading date in a range
 # --------------------------------------------------------------------------- #
-def scan_qualified_dates(code: str = DEFAULT_CODE, start_date: str = "",
+def scan_qualified_dates(code: str = DEFAULT_CODES[0], start_date: str = "",
                          end_date: str | None = None,
                          threshold: float = DIP_THRESHOLD,
                          timeout: float = 10.0) -> tuple[list[Result], int]:
@@ -271,7 +281,7 @@ def format_scan_report(code: str, results: Sequence[Result],
                        start_date: str, end_date: str | None,
                        scanned: int) -> str:
     span = f"{start_date or 'earliest available'} ~ {end_date or 'today'}"
-    lines = [f"ETF {code} - 5-day dip scan [{span}]",
+    lines = [f"{code} - 5-day dip scan [{span}]",
              f"trading days scanned: {scanned}, qualified: {len(results)}", ""]
     if not results:
         lines.append("no qualified dates found")
@@ -300,7 +310,7 @@ def performance_report(code: str, start_date: str, days: int = 3,
                and evaluate(bars[:i + 1], threshold=threshold).qualified]
 
     span = f"{start_date} ~ {end_date or 'today'}"
-    lines = [f"ETF {code} - signal performance [{span}]",
+    lines = [f"{code} - signal performance [{span}]",
              f"buy at signal-day close, hold {days} trading day(s)", ""]
     if not signals:
         lines.append("no qualified signals found in range")
@@ -339,7 +349,7 @@ def performance_report(code: str, start_date: str, days: int = 3,
 
 
 def format_report(code: str, res: Result) -> str:
-    lines = [f"ETF {code} - last 5 trading days"]
+    lines = [f"{code} - last 5 trading days"]
     lines.append(f"{'date':<12}{'open':>8}{'close':>8}{'chg%':>9}")
     prev = None
     for b in res.window:
@@ -358,13 +368,86 @@ def format_report(code: str, res: Result) -> str:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def run_one(code: str, args: argparse.Namespace) -> tuple[int, dict]:
+    """Evaluate one code; return (exit_code, json_entry).
+
+    exit_code 0 means at least one qualified signal was found for this code.
+    """
+    if args.scan is not None:
+        results, scanned = scan_qualified_dates(
+            code, start_date=args.scan, end_date=args.end,
+            threshold=args.threshold)
+        entry = {
+            "code": code,
+            "mode": "scan",
+            "scan_start": args.scan,
+            "scan_end": args.end,
+            "days_scanned": scanned,
+            "qualified_dates": [r.window[-1].date for r in results],
+            "results": [_result_json(r) for r in results],
+        }
+        if not args.json:
+            print(format_scan_report(code, results, args.scan, args.end, scanned))
+        return (0 if results else 1), entry
+
+    if args.after is not None:
+        report, n_signals = performance_report(
+            code, start_date=args.after, days=args.days,
+            end_date=args.end, threshold=args.threshold)
+        entry = {
+            "code": code,
+            "mode": "performance",
+            "scan_start": args.after,
+            "scan_end": args.end,
+            "days_scanned": n_signals,
+            "qualified_dates": [],   # keep --json light; full detail is in report
+            "results": [],
+            "report": report.splitlines(),
+        }
+        if not args.json:
+            print(report)
+        return (0 if n_signals else 1), entry
+
+    if args.csv:
+        bars = load_bars_csv(args.csv)
+    else:
+        bars = fetch_bars(code, limit=LOOKBACK, end_date=args.date)
+        if args.save_csv:
+            save_bars_csv(bars, args.save_csv)
+    res = evaluate(bars, threshold=args.threshold)
+    entry = {
+        "code": code,
+        "mode": "latest",
+        "scan_start": None,
+        "scan_end": args.date,
+        "days_scanned": 1,
+        "qualified_dates": [res.window[-1].date] if res.qualified else [],
+        "results": [_result_json(res)],
+    }
+    if not args.json:
+        print(format_report(code, res))
+    return (0 if res.qualified else 1), entry
+
+
+def _result_json(r: Result) -> dict:
+    return {
+        "signal_date": r.window[-1].date,
+        "qualified": r.qualified,
+        "message": r.message,
+        "reason": r.reason,
+        "dip_return": None if r.dip_return is None else round(r.dip_return, 6),
+        "window": [b.__dict__ for b in r.window],
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="5-day dip buy-in checker")
-    ap.add_argument("code", nargs="?", default=DEFAULT_CODE,
-                    help=f"ETF code (default {DEFAULT_CODE})")
+    ap = argparse.ArgumentParser(description="5-day dip buy-in checker (A-share ETF/stock)")
+    ap.add_argument("codes", nargs="*", default=list(DEFAULT_CODES),
+                    help="A股代码，可传多个（默认 600276 300750；ETF 如 513520 同样适用）")
     ap.add_argument("--date", help="as-of date YYYY-MM-DD (default: latest bar)")
-    ap.add_argument("--csv", help="read bars from this CSV instead of the network")
-    ap.add_argument("--save-csv", help="cache fetched bars to this CSV")
+    ap.add_argument("--csv", help="read bars from this CSV instead of the network "
+                                 "(single code only)")
+    ap.add_argument("--save-csv", help="cache fetched bars to this CSV (single code only)")
     ap.add_argument("--threshold", type=float, default=DIP_THRESHOLD,
                     help="rule 1 threshold: (low5 - close0) / close0 "
                          "(default -0.05)")
@@ -377,56 +460,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--days", type=int, default=3,
                     help="holding horizon in trading days for --after (default 3)")
     ap.add_argument("--end", help="scan end date YYYY-MM-DD (default: today)")
-    ap.add_argument("--json", action="store_true", help="print JSON result")
+    ap.add_argument("--json", action="store_true",
+                    help="print JSON result (one entry per code)")
     args = ap.parse_args(argv)
 
-    try:
-        if args.scan is not None:
-            results, scanned = scan_qualified_dates(
-                args.code, start_date=args.scan, end_date=args.end,
-                threshold=args.threshold)
-        elif args.after is not None:
-            report, n_signals = performance_report(
-                args.code, start_date=args.after, days=args.days,
-                end_date=args.end, threshold=args.threshold)
-        else:
-            if args.csv:
-                bars = load_bars_csv(args.csv)
-            else:
-                bars = fetch_bars(args.code, limit=LOOKBACK, end_date=args.date)
-                if args.save_csv:
-                    save_bars_csv(bars, args.save_csv)
-            results, scanned = [evaluate(bars, threshold=args.threshold)], 1
-    except Exception as exc:  # noqa: BLE001 - CLI boundary
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
+    codes = args.codes or list(DEFAULT_CODES)
+    overall = 1                     # 0 if any code produced a qualified signal
+    entries: list[dict] = []
+    for i, code in enumerate(codes):
+        try:
+            rc, entry = run_one(code, args)
+            if rc == 0:
+                overall = 0
+        except Exception as exc:    # noqa: BLE001 - CLI boundary
+            print(f"ERROR [{code}]: {exc}", file=sys.stderr)
+            entry = {"code": code, "mode": "error", "error": str(exc),
+                     "days_scanned": 0, "qualified_dates": [], "results": []}
+        entries.append(entry)
+        if i < len(codes) - 1:
+            print()
 
     if args.json:
         print(json.dumps({
-            "code": args.code,
-            "scan_start": args.scan,
-            "scan_end": args.end,
-            "days_scanned": scanned,
-            "qualified_dates": [r.window[-1].date for r in results],
-            "results": [{
-                "signal_date": r.window[-1].date,
-                "qualified": r.qualified,
-                "message": r.message,
-                "reason": r.reason,
-                "dip_return": None if r.dip_return is None
-                else round(r.dip_return, 6),
-                "window": [b.__dict__ for b in r.window],
-            } for r in results],
+            "codes": codes,
+            "any_qualified": overall == 0,
+            "entries": entries,
         }, ensure_ascii=False, indent=2))
-    elif args.after is not None:
-        print(report)
-    elif args.scan is not None:
-        print(format_scan_report(args.code, results, args.scan, args.end, scanned))
-    else:
-        print(format_report(args.code, results[0]))
-    if args.after is not None:
-        return 0 if n_signals else 1
-    return 0 if results else 1
+    return overall
 
 
 if __name__ == "__main__":
